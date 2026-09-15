@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Form Filler",
+  "description": "Save and replay named fillings for forms on sites you explicitly enable.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "120",
+  "permissions": ["activeTab", "scripting", "storage", "debugger", "alarms"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "worker.js", "type": "module" },
+  "action": {
+    "default_title": "Form Filler",
+    "default_popup": "popup.html"
+  },
+  "options_page": "library.html",
+  "icons": {}
+}
