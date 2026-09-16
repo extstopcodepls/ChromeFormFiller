@@ -1,4 +1,4 @@
-import type { CapturedField, FillResult, FormIdentity, FormSnapshot, MatchSummary, PendingDraft, SavedFilling, SiteStatus } from './types';
+import type { CapturedField, FieldValue, FillResult, FormIdentity, FormSnapshot, MatchSummary, PendingDraft, SavedFilling, SiteStatus } from './types';
 
 export type Message =
   | { type: 'GET_SITE_STATUS'; requestId: string; tabUrl?: string }
@@ -13,7 +13,7 @@ export type Message =
   | { type: 'CAPTURE_FORM'; requestId: string; form: FormSnapshot; saveDraft?: boolean }
   | { type: 'SUBMISSION_OBSERVED'; requestId: string; form: FormSnapshot }
   | { type: 'SAVE_FILLING'; requestId: string; draftId?: string; filling?: SavedFilling; name?: string; excludedKeys?: string[] }
-  | { type: 'UPDATE_FILLING'; requestId: string; id: string; name?: string; excludedKeys?: string[] }
+  | { type: 'UPDATE_FILLING'; requestId: string; id: string; name?: string; excludedKeys?: string[]; fieldValues?: Record<string, FieldValue> }
   | { type: 'DELETE_FILLING'; requestId: string; id: string }
   | { type: 'DELETE_SITE_FILLINGS'; requestId: string; origin: string }
   | { type: 'CLEAR_VAULT'; requestId: string }

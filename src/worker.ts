@@ -4,7 +4,7 @@ import { createVault, decryptRecord, encryptRecord, fromSessionKey, toSessionKey
 import { deleteDraftEnvelope, deleteEntryEnvelope, getConfig, getDraftEnvelope, getDraftIds, getEntryEnvelope, getEntryIds, getSession, getVaultMeta, removeLocal, setConfig, setDraftEnvelope, setDraftIds, setEntryEnvelope, setEntryIds, setSession, setVaultMeta } from './storage';
 import { explainSnapshotMatch, fieldMatchKeys, matchesForForm, matchesForSnapshot, suggestedName, sameForm } from './matching';
 import { captureFilePaths, replay } from './replay';
-import type { FormSnapshot, PendingDraft, SavedFilling, SiteStatus } from './types';
+import type { FieldValue, FormSnapshot, PendingDraft, SavedFilling, SiteStatus } from './types';
 
 const SESSION_KEY = 'sessionDataKey';
 const ACTIVITY_KEY = 'activityAt';
@@ -24,6 +24,13 @@ function originFromUrl(url?: string): string | undefined {
 function permissionPattern(origin: string): string { const parsed = new URL(origin); return `${parsed.protocol}//${parsed.hostname}/*`; }
 function formKey(form: FormSnapshot['form']): string { return `${form.origin}|${form.pathname}|${form.formId}|${form.formName}|${form.formIndex ?? ''}|${form.fingerprint}`; }
 function fieldSummary(field: SavedFilling['fields'][number]): string { const value = field.value; if (value.tag === 'file') return value.files.map((file) => file.name).join(', ') || '(empty file selection)'; if (value.tag === 'options') return value.values.join(', ') || '(empty selection)'; if (value.tag === 'boolean') return String(value.value); if (value.tag === 'radio') return value.value ?? '(none selected)'; return value.value || '(empty)'; }
+function valueMatchesKind(kind: SavedFilling['fields'][number]['descriptor']['kind'], value: FieldValue): boolean {
+  if (kind === 'checkbox') return value.tag === 'boolean';
+  if (kind === 'radio') return value.tag === 'radio';
+  if (kind === 'select-one' || kind === 'select-multiple') return value.tag === 'options';
+  if (kind === 'file') return value.tag === 'file';
+  return value.tag === 'text';
+}
 function serializedFieldSummary(field: SavedFilling['fields'][number], fieldIndex: number): Record<string, unknown> { return { fieldIndex, resultKey: field.descriptor.key, kind: field.descriptor.kind, included: field.included, matchKeys: fieldMatchKeys(field.descriptor) }; }
 async function enabled(origin: string): Promise<boolean> { return (await getConfig()).enabledOrigins.includes(origin); }
 async function touch(): Promise<void> { const now = Date.now(); await setSession({ [ACTIVITY_KEY]: now }); }
@@ -155,7 +162,7 @@ async function handle(message: Message, sender: chrome.runtime.MessageSender): P
     if (message.draftId) { await deleteDraftEnvelope(message.draftId); await setDraftIds((await getDraftIds()).filter((id) => id !== message.draftId)); }
     return { ok: true, requestId: message.requestId, filling };
   }
-  if (message.type === 'UPDATE_FILLING') { const envelope = await getEntryEnvelope(message.id); if (!envelope) throw new Error('Saved filling not found.'); const old = await decryptRecord<SavedFilling>(key, envelope); const updated = { ...old, name: message.name?.trim() || old.name, fields: old.fields.map((field) => ({ ...field, included: message.excludedKeys ? !message.excludedKeys.includes(field.descriptor.key) : field.included })), updatedAt: Date.now() }; await setEntryEnvelope(updated.id, await encryptRecord(key, updated)); return { ok: true, requestId: message.requestId, filling: updated };
+  if (message.type === 'UPDATE_FILLING') { const envelope = await getEntryEnvelope(message.id); if (!envelope) throw new Error('Saved filling not found.'); const old = await decryptRecord<SavedFilling>(key, envelope); const updated = { ...old, name: message.name?.trim() || old.name, fields: old.fields.map((field) => { const candidate = message.fieldValues?.[field.descriptor.key]; return { ...field, value: candidate && valueMatchesKind(field.descriptor.kind, candidate) ? candidate : field.value, included: message.excludedKeys ? !message.excludedKeys.includes(field.descriptor.key) : field.included }; }), updatedAt: Date.now() }; await setEntryEnvelope(updated.id, await encryptRecord(key, updated)); return { ok: true, requestId: message.requestId, filling: updated };
   }
   if (message.type === 'DELETE_FILLING') { const ids = await getEntryIds(); await deleteEntryEnvelope(message.id); await setEntryIds(ids.filter((id) => id !== message.id)); return { ok: true, requestId: message.requestId }; }
   if (message.type === 'DELETE_SITE_FILLINGS') { const entries = await allEntries(key); const remove = entries.filter((entry) => entry.form.origin === message.origin).map((entry) => entry.id); const ids = await getEntryIds(); for (const id of remove) await deleteEntryEnvelope(id); await setEntryIds(ids.filter((id) => !remove.includes(id))); return { ok: true, requestId: message.requestId }; }
