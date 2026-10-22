@@ -181,6 +181,7 @@ function createSubmissionPrompt(draftId: string, form: FormIdentity): void {
   const review = document.createElement('button'); review.className = 'action'; review.type = 'button'; review.textContent = 'Review and save'; review.addEventListener('click', () => { finish(); void request<any>({ type: 'OPEN_LIBRARY', requestId: newRequestId(), draftId }); });
   const dismiss = document.createElement('button'); dismiss.className = 'action secondary'; dismiss.type = 'button'; dismiss.textContent = 'Dismiss'; dismiss.addEventListener('click', () => { finish(); void request<any>({ type: 'DISMISS_DRAFT', requestId: newRequestId(), id: draftId }); });
   const never = document.createElement('button'); never.className = 'action secondary'; never.type = 'button'; never.textContent = 'Never offer for this form'; never.addEventListener('click', () => { finish(); void request<any>({ type: 'IGNORE_FORM', requestId: newRequestId(), form }).then(() => request<any>({ type: 'DISMISS_DRAFT', requestId: newRequestId(), id: draftId })); });
+  window.setTimeout(finish, 10_000);
   actions.append(review, dismiss, never); card.append(heading, notice, actions); shadow.append(style, card); document.documentElement.append(host);
 }
 async function showPendingSubmissionPrompt(attempt = 0): Promise<void> {

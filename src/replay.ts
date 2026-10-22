@@ -5,8 +5,16 @@ import { normalizeWaitAfterFillMs, waitAfterFill } from './delay';
 type Cdp = (method: string, params?: Record<string, unknown>) => Promise<any>;
 type ReplayLogger = (event: string, details?: Record<string, unknown>) => void;
 
+export const FILE_ACCESS_REQUIRED = 'Enable "Allow access to file URLs" in chrome://extensions → Chrome Form Filler → Details. Then select the files and save the form again.';
+function filePathStatus(path: unknown): 'missing' | 'empty' | 'fake' | 'usable' | 'unsupported' {
+  if (typeof path !== 'string') return 'missing';
+  if (!path) return 'empty';
+  if (/^[A-Za-z]:\\fakepath\\/i.test(path)) return 'fake';
+  return /^(?:[A-Za-z]:\\|\\\\)/.test(path) ? 'usable' : 'unsupported';
+}
+
 function jsString(value: string): string { return JSON.stringify(value); }
-function safeDebugReason(message: string): string { return /(?:[A-Za-z]:\\|\\\\)/.test(message) ? 'The browser reported an error containing a local path.' : message; }
+export function safeDebugReason(message: string): string { return /(?:[A-Za-z]:\\|\\\\)/.test(message) ? 'The browser reported an error containing a local path.' : message; }
 function formLocator(form?: FormIdentity): string {
   if (!form) return 'null';
   const candidates: string[] = [];
@@ -109,37 +117,62 @@ async function describe(cdp: Cdp, field: CapturedField, form: FormIdentity): Pro
 }
 
 /** Uses only browser-provided File remote objects; page content never supplies paths. */
-export async function captureFilePaths(cdp: Cdp, snapshot: FormSnapshot): Promise<FormSnapshot> {
+export async function captureFilePaths(cdp: Cdp, snapshot: FormSnapshot, log: ReplayLogger = () => undefined): Promise<FormSnapshot> {
   const fields = snapshot.fields.map((field) => ({ ...field, value: field.value.tag === 'file' ? { ...field.value, files: field.value.files.map((file) => ({ ...file })) } : field.value }));
-  for (const field of fields) {
+  for (const [fieldIndex, field] of fields.entries()) {
     if (field.descriptor.kind !== 'file' || field.value.tag !== 'file') continue;
     if (!field.value.files.length) { delete field.unavailableReason; continue; }
+    const context = { fieldIndex, resultKey: field.descriptor.key, fileCount: field.value.files.length };
+    const unavailable = (reason: string): void => {
+      field.unavailableReason = reason;
+      log('file.capture.manual', { ...context, reason });
+    };
+    let stage = 'Runtime.evaluate';
+    log('file.capture.start', context);
     try {
       // `files` is a native accessor, so getProperties(input) may return a
       // getter descriptor rather than a value. Evaluate it explicitly and
       // retain a stable array while the asynchronous CDP requests run.
       const expected = JSON.stringify(field.value.files.map(({ name, size, lastModified }) => ({ name, size, lastModified })));
-      const expression = `(function(){const e=${guardedLocator(field, snapshot.form)};if(!e)return null;const files=Array.from(e.files||[]);const expected=${expected};if(files.length!==expected.length||files.some((file,index)=>{const saved=expected[index];return file.name!==saved.name||(saved.size!==undefined&&file.size!==saved.size)||(saved.lastModified!==undefined&&file.lastModified!==saved.lastModified)}))return null;return files})()`;
+      const expression = `(function(){const e=${guardedLocator(field, snapshot.form)};if(!e)return 'control-missing';const files=Array.from(e.files||[]);const expected=${expected};if(files.length!==expected.length||files.some((file,index)=>{const saved=expected[index];return file.name!==saved.name||(saved.size!==undefined&&file.size!==saved.size)||(saved.lastModified!==undefined&&file.lastModified!==saved.lastModified)}))return 'selection-changed';return files})()`;
       const evaluated = await cdp('Runtime.evaluate', { expression, objectGroup: 'form-filler-file-capture', returnByValue: false });
+      if (evaluated.exceptionDetails) throw new Error('File selection evaluation raised a JavaScript exception.');
       const filesObjectId = evaluated.result?.objectId;
-      if (!filesObjectId) continue;
+      if (!filesObjectId) {
+        const decision = evaluated.result?.value;
+        unavailable(decision === 'control-missing' ? 'The file control was missing when Chrome captured its paths. Save the form before navigating or submitting.' : decision === 'selection-changed' ? 'The file selection changed before Chrome captured its paths. Select the files and save the form again.' : 'Chrome did not return a remote file selection object. Enable debug logging and save the form again.');
+        continue;
+      }
+      stage = 'Runtime.getProperties';
       const fileListProperties = await cdp('Runtime.getProperties', { objectId: filesObjectId, ownProperties: true });
+      if (fileListProperties.exceptionDetails) throw new Error('Inspecting the file selection raised a JavaScript exception.');
       const fileObjects = fileListProperties.result?.filter((property: any) => /^\d+$/.test(property.name)).sort((a: any, b: any) => Number(a.name) - Number(b.name)).map((property: any) => property.value?.objectId) ?? [];
-      if (fileObjects.length !== field.value.files.length || fileObjects.some((objectId: unknown) => typeof objectId !== 'string')) continue;
+      const validObjects = fileObjects.length === field.value.files.length && fileObjects.every((objectId: unknown) => typeof objectId === 'string');
+      log('file.capture.objects', { ...context, remoteFileCount: fileObjects.length, validObjects });
+      if (!validObjects) { unavailable('Chrome did not expose all selected File objects. Enable debug logging and save the form again.'); continue; }
       const captured = [] as Array<{ path: string; name: string; size?: number; lastModified?: number }>;
-      for (const fileObjectId of fileObjects) {
+      stage = 'DOM.getFileInfo';
+      for (const [fileIndex, fileObjectId] of fileObjects.entries()) {
         const info = await cdp('DOM.getFileInfo', { objectId: fileObjectId });
-        const path = typeof info?.path === 'string' ? info.path : '';
-        if (/^(?:[A-Za-z]:\\|\\\\)/.test(path)) captured.push({ path, name: field.value.files[captured.length]?.name ?? 'file', size: field.value.files[captured.length]?.size, lastModified: field.value.files[captured.length]?.lastModified });
+        const pathStatus = filePathStatus(info?.path);
+        log('file.capture.path', { ...context, fileIndex, pathStatus });
+        if (pathStatus === 'usable') captured.push({ ...field.value.files[fileIndex], path: info.path });
       }
       if (captured.length === field.value.files.length) {
         field.value.files = captured;
         delete field.unavailableReason;
+        log('file.capture.complete', { ...context, capturedPathCount: captured.length });
+      } else {
+        unavailable('Chrome returned an empty, fake, or unsupported local path for a selected file. Use the native file picker and save the form again.');
       }
-    } catch {
-      // DOM.getFileInfo is experimental. Preserve the metadata and require reselection.
+    } catch (error) {
+      // DOM.getFileInfo is experimental; distinguish a permission denial from
+      // missing handles, navigation races, and unsupported protocol commands.
+      const message = error instanceof Error ? error.message : 'Unknown debugger error';
+      log('file.capture.error', { ...context, stage, message: safeDebugReason(message) });
+      unavailable(stage === 'DOM.getFileInfo' && /not allowed|access denied/i.test(message) ? `Chrome denied local file access. ${FILE_ACCESS_REQUIRED}` : `File path capture failed at ${stage}. Enable debug logging and save the form again.`);
     } finally {
-      await cdp('Runtime.releaseObjectGroup', { objectGroup: 'form-filler-file-capture' }).catch(() => undefined);
+      await cdp('Runtime.releaseObjectGroup', { objectGroup: 'form-filler-file-capture' }).catch(() => { log('file.capture.cleanup-failed', context); });
     }
   }
   return { ...snapshot, fields };
@@ -194,7 +227,7 @@ async function setControlValue(cdp: Cdp, field: CapturedField, form: FormIdentit
   return reply.result?.value === true;
 }
 
-export async function replay(cdp: Cdp, filling: SavedFilling, isCanceled: () => boolean, log: ReplayLogger = () => undefined, traceMatching = false): Promise<FillResult> {
+export async function replay(cdp: Cdp, filling: SavedFilling, isCanceled: () => boolean, log: ReplayLogger = () => undefined, traceMatching = false, fileAccessAllowed?: boolean): Promise<FillResult> {
   const fields: FillFieldResult[] = [];
   const deadline = Date.now() + 120_000;
   const includedFields = filling.fields.filter((item) => item.included);
@@ -215,9 +248,20 @@ export async function replay(cdp: Cdp, filling: SavedFilling, isCanceled: () => 
         const nodeId = await nodeFor(cdp, field, filling.form);
         if (!nodeId) { const message = 'Control could not be resolved inside the saved form.'; log('field.missing', { fieldIndex, reason: message }); fields.push(fieldResult(field, fieldIndex, 'missing', message)); continue; }
         const files = field.value.tag === 'file' ? field.value.files : [];
-        const paths = files.map((file) => file.path).filter((path): path is string => typeof path === 'string' && /^(?:[A-Za-z]:\\|\\\\)/.test(path));
-        if (paths.length !== files.length) { const message = 'File reselection is required because Chrome did not expose a reusable local path.'; log('field.manual', { fieldIndex, reason: message }); fields.push(fieldResult(field, fieldIndex, 'manual', message)); continue; }
-        await cdp('DOM.setFileInputFiles', { nodeId, files: paths });
+        const paths = files.map((file) => file.path).filter((path): path is string => filePathStatus(path) === 'usable');
+        log('file.replay.paths', { fieldIndex, fileCount: files.length, reusablePathCount: paths.length, pathStatuses: files.map((file) => filePathStatus(file.path)), fileAccessAllowed, captureReason: field.unavailableReason ? safeDebugReason(field.unavailableReason) : undefined });
+        if (paths.length !== files.length || fileAccessAllowed === false) {
+          const message = fileAccessAllowed === false ? `Chrome local file access is disabled. ${FILE_ACCESS_REQUIRED}` : `This saved filling has no reusable local path for ${files.length - paths.length} file(s). Select the files and save the form again.${field.unavailableReason ? ` Capture: ${safeDebugReason(field.unavailableReason)}` : ' Enable debug logging before saving to diagnose path capture.'}`;
+          log('field.manual', { fieldIndex, reason: message }); fields.push(fieldResult(field, fieldIndex, 'manual', message)); continue;
+        }
+        try { await cdp('DOM.setFileInputFiles', { nodeId, files: paths }); }
+        catch (error) {
+          const message = error instanceof Error ? error.message : 'Unknown debugger error';
+          log('file.replay.error', { fieldIndex, stage: 'DOM.setFileInputFiles', message: safeDebugReason(message) });
+          if (!/not allowed|access denied/i.test(message)) throw error;
+          const reason = `Chrome denied local file access. ${FILE_ACCESS_REQUIRED}`;
+          log('field.manual', { fieldIndex, reason }); fields.push(fieldResult(field, fieldIndex, 'manual', reason)); continue;
+        }
         const afterFiles = (await describe(cdp, field, filling.form))?.files ?? [];
         const wantedFiles = files.map((file) => file.name);
         const verified = JSON.stringify(afterFiles) === JSON.stringify(wantedFiles);

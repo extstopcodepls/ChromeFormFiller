@@ -21,6 +21,19 @@ The first vault unlock creates a local vault. There is no passphrase recovery. S
 
 Open the extension popup and enable **Enable debug logging**. The target page's DevTools Console shows `[Form Filler]` form discovery, every control's eligibility decision, and each independently serialized `id`, `name`, `label`, and `position` lookup key. Its `fill.requested` and `fill.completed` events include the complete target-form identity and value-free intended/current/per-result field metadata. The extension service worker's DevTools console shows `[Form Filler][worker]` decisions for every saved-form candidate. Each field trace records all independent key attempts, their compatible candidate counts, ambiguity, and the selected strategy. `[Form Filler][replay] field.match` reports the same lookup attempts against the live DOM; open it from **chrome://extensions → Form Filler → Service worker → Inspect**. The inline fill result also exposes **Field details** for every manual, missing, or failed control. Debug output intentionally excludes field values and local file paths.
 
+### File path capture and replay
+
+Chrome gates both `DOM.getFileInfo` (capture) and `DOM.setFileInputFiles` (replay) on the extension's **Allow access to file URLs** setting, even on HTTP/HTTPS pages. Chromium's [DOM handler](https://github.com/chromium/chromium/blob/main/content/browser/devtools/protocol/dom_handler.cc) returns `Not allowed` when file access is disabled; the [extension debugger implementation](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/chrome/browser/extensions/api/debugger/debugger_api.cc) uses that setting for local-file access. The commands still exist in [CDP](https://chromedevtools.github.io/devtools-protocol/tot/DOM/); `DOM.getFileInfo` remains experimental. This identifies a current permission requirement, not evidence of a particular recent Chrome regression.
+
+For a filling that reports no reusable local path:
+
+1. Reload the built extension from `dist` and refresh the target page.
+2. Open **chrome://extensions → Chrome Form Filler → Details** and enable **Allow access to file URLs**. The existing `activeTab` permission makes this setting available.
+3. Enable debug logging, open the extension's **Service worker → Inspect** console, select the files using the page's native file picker, and use **Save current** before submitting or navigating. Save the resulting draft as a new filling. Changing the Chrome setting cannot recover paths from old entries that contain only metadata.
+4. Replay the new filling. If it still fails, inspect the `[Form Filler][capture]` events from saving and `[Form Filler][replay]` events from filling.
+
+`file.environment` records the browser user agent, extension version, and `fileAccessAllowed` from [`chrome.extension.isAllowedFileSchemeAccess()`](https://developer.chrome.com/docs/extensions/reference/api/extension#method-isAllowedFileSchemeAccess). Capture logs include the field index/key, expected and remote file counts, the failing CDP stage and sanitized error, and each returned path's classification (`usable`, `empty`, `missing`, `fake`, or `unsupported`). Replay's `file.replay.paths` records saved/reusable path counts and the saved capture failure reason. File names and paths are not included in these file diagnostics. Missing controls, changed selections, unavailable File objects, and protocol failures retain distinct reasons in the saved draft. Empty paths can also occur for files constructed by page scripts without a backing local file; only absolute Windows drive or UNC paths are reusable in this Windows-targeted extension.
+
 ## Verification
 
 The repository includes unit coverage for exact form matching and the AES-GCM/PBKDF2 vault envelope. Native replay and Chrome permission/debugger behavior require a headed Windows Chrome run with a fixture page.

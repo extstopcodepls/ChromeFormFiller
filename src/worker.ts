@@ -4,7 +4,7 @@ import { createVault, decryptRecord, encryptRecord, fromSessionKey, toSessionKey
 import { deleteDraftEnvelope, deleteEntryEnvelope, getConfig, getDraftEnvelope, getDraftIds, getEntryEnvelope, getEntryIds, getSession, getVaultMeta, removeLocal, setConfig, setDraftEnvelope, setDraftIds, setEntryEnvelope, setEntryIds, setSession, setVaultMeta } from './storage';
 import { explainSnapshotMatch, fieldMatchKeys, matchesForForm, matchesForSnapshot, suggestedName, sameForm } from './matching';
 import { normalizeWaitAfterFillMs, normalizeWaitAfterFillOverrideMs } from './delay';
-import { captureFilePaths, replay } from './replay';
+import { captureFilePaths, replay, safeDebugReason } from './replay';
 import type { FieldValue, FormSnapshot, PendingDraft, SavedFilling, SiteStatus } from './types';
 
 const SESSION_KEY = 'sessionDataKey';
@@ -117,20 +117,45 @@ async function enableDomReplay(cdp: (method: string, params?: Record<string, unk
   // return the sentinel nodeId 0 for an otherwise valid Runtime object.
   await cdp('DOM.getDocument', { depth: 0 });
 }
+async function fileAccessState(log?: (event: string, details?: Record<string, unknown>) => void): Promise<boolean | undefined> {
+  try {
+    // Chromium gates DOM.getFileInfo and DOM.setFileInputFiles on this same
+    // user-controlled setting, including when the target page is HTTPS.
+    const fileAccessAllowed = await chrome.extension.isAllowedFileSchemeAccess();
+    log?.('file.environment', { fileAccessAllowed, userAgent: navigator.userAgent, extensionVersion: chrome.runtime.getManifest().version });
+    return fileAccessAllowed;
+  } catch (error) {
+    log?.('file.environment.error', { message: safeDebugReason(error instanceof Error ? error.message : 'Could not check extension file access.') });
+    return undefined;
+  }
+}
 async function cdpReplay(tabId: number, filling: SavedFilling, currentForm: SavedFilling['form']): Promise<ReturnType<typeof replay>> {
   const debug = (await getConfig()).debug; const log = debug ? (event: string, details: Record<string, unknown> = {}) => { console.info('[Form Filler][replay]', event, details); } : undefined;
+  const fileAccessAllowed = filling.fields.some((field) => field.included && field.descriptor.kind === 'file') ? await fileAccessState(log) : undefined;
   cancelTabs.delete(tabId); log?.('debugger.attach', { tabId }); await chrome.debugger.attach({ tabId }, '1.3');
   const cdp = (method: string, params?: Record<string, unknown>) => chrome.debugger.sendCommand({ tabId }, method, params);
-  try { await enableDomReplay(cdp); const result = await replay(cdp, { ...filling, form: currentForm }, () => cancelTabs.has(tabId), log, debug); log?.('replay.complete', { status: result.status, fieldCount: result.fields.length, failedCount: result.fields.filter((field) => ['missing', 'manual', 'failed'].includes(field.status)).length }); return result; }
-  catch (error) { log?.('replay.error', { message: error instanceof Error ? error.message : 'Unknown debugger error' }); throw error; }
+  try { await enableDomReplay(cdp); const result = await replay(cdp, { ...filling, form: currentForm }, () => cancelTabs.has(tabId), log, debug, fileAccessAllowed); log?.('replay.complete', { status: result.status, fieldCount: result.fields.length, failedCount: result.fields.filter((field) => ['missing', 'manual', 'failed'].includes(field.status)).length }); return result; }
+  catch (error) { log?.('replay.error', { message: safeDebugReason(error instanceof Error ? error.message : 'Unknown debugger error') }); throw error; }
   finally { await chrome.debugger.detach({ tabId }).catch(() => undefined); log?.('debugger.detach', { tabId }); }
 }
 async function captureSnapshot(tabId: number | undefined, snapshot: FormSnapshot): Promise<FormSnapshot> {
   if (tabId === undefined || !snapshot.fields.some((field) => field.descriptor.kind === 'file' && field.value.tag === 'file' && field.value.files.length)) return snapshot;
-  await chrome.debugger.attach({ tabId }, '1.3');
+  const debug = (await getConfig()).debug;
+  const log = debug ? (event: string, details: Record<string, unknown> = {}) => { console.info('[Form Filler][capture]', event, { tabId, ...details }); } : undefined;
+  await fileAccessState(log);
   const cdp = (method: string, params?: Record<string, unknown>) => chrome.debugger.sendCommand({ tabId }, method, params);
-  try { await enableDomReplay(cdp); return await captureFilePaths(cdp, snapshot); }
-  finally { await chrome.debugger.detach({ tabId }).catch(() => undefined); }
+  let attached = false;
+  let stage = 'debugger.attach';
+  try {
+    log?.('debugger.attach', { protocolVersion: '1.3' });
+    await chrome.debugger.attach({ tabId }, '1.3'); attached = true;
+    stage = 'debugger.initialize'; await enableDomReplay(cdp);
+    stage = 'file.capture'; return await captureFilePaths(cdp, snapshot, log);
+  } catch (error) {
+    log?.('capture.error', { stage, message: safeDebugReason(error instanceof Error ? error.message : 'Unknown debugger error') }); throw error;
+  } finally {
+    if (attached) { await chrome.debugger.detach({ tabId }).catch(() => undefined); log?.('debugger.detach'); }
+  }
 }
 
 const workerReady = (async () => {

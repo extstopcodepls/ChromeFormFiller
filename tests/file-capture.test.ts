@@ -69,7 +69,8 @@ describe('file path capture', () => {
   it('preserves metadata on failure, releases handles, and continues with other inputs', async () => {
     const test = fixture([['first.pdf', 'unavailable.pdf'], ['third.pdf']]);
     const captured = await captureFilePaths(test.cdp, test.snapshot);
-    expect(captured.fields[0]).toEqual(test.snapshot.fields[0]);
+    expect(captured.fields[0].value).toEqual(test.snapshot.fields[0].value);
+    expect(captured.fields[0].unavailableReason).toContain('DOM.getFileInfo');
     expect(captured.fields[1].unavailableReason).toBeUndefined();
     expect(captured.fields[1].value).toEqual({ tag: 'file', files: [{ ...metadata('third.pdf'), path: 'C:\\uploads\\third.pdf' }] });
     expect(test.releases()).toBe(2);
@@ -80,7 +81,8 @@ describe('file path capture', () => {
     const test = fixture([['first.pdf']]);
     test.selections[0][0] = 'replacement.pdf';
     const captured = await captureFilePaths(test.cdp, test.snapshot);
-    expect(captured.fields[0]).toEqual(test.snapshot.fields[0]);
+    expect(captured.fields[0].value).toEqual(test.snapshot.fields[0].value);
+    expect(captured.fields[0].unavailableReason).toContain('selection changed');
     expect(test.fileInfoCalls).toEqual([]);
     expect(test.releases()).toBe(1);
   });
@@ -90,5 +92,73 @@ describe('file path capture', () => {
     const captured = await captureFilePaths(test.cdp, test.snapshot);
     expect(captured.fields[0].unavailableReason).toBeUndefined();
     expect(test.releases()).toBe(0);
+  });
+
+  it('reports a CDP file-access denial with recovery instructions and still releases handles', async () => {
+    const test = fixture([['private-name.pdf']]);
+    const events: Array<{ event: string; details?: Record<string, unknown> }> = [];
+    const captured = await captureFilePaths(async (method, params) => {
+      if (method === 'DOM.getFileInfo') throw new Error('{"code":-32000,"message":"Not allowed"}');
+      return test.cdp(method, params);
+    }, test.snapshot, (event, details) => events.push({ event, details }));
+    expect(captured.fields[0].unavailableReason).toContain('Allow access to file URLs');
+    expect(captured.fields[0].value).toEqual(test.snapshot.fields[0].value);
+    expect(events.find(({ event }) => event === 'file.capture.error')?.details).toMatchObject({ fieldIndex: 0, stage: 'DOM.getFileInfo', message: '{"code":-32000,"message":"Not allowed"}' });
+    expect(JSON.stringify(events)).not.toContain('private-name.pdf');
+    expect(test.releases()).toBe(1);
+    expect(test.objects.size).toBe(0);
+  });
+
+  it.each([
+    ['', 'empty'],
+    [undefined, 'missing'],
+    ['C:\\fakepath\\private-name.pdf', 'fake'],
+    ['/home/private/private-name.pdf', 'unsupported'],
+  ])('diagnoses unusable paths without logging them (%s)', async (path, pathStatus) => {
+    const test = fixture([['private-name.pdf']]);
+    const events: Array<{ event: string; details?: Record<string, unknown> }> = [];
+    const captured = await captureFilePaths(async (method, params) => method === 'DOM.getFileInfo' ? { path } : test.cdp(method, params), test.snapshot, (event, details) => events.push({ event, details }));
+    expect(captured.fields[0].value).toEqual(test.snapshot.fields[0].value);
+    expect(captured.fields[0].unavailableReason).toContain('empty, fake, or unsupported');
+    expect(events.find(({ event }) => event === 'file.capture.path')?.details).toMatchObject({ fileIndex: 0, pathStatus });
+    expect(JSON.stringify(events)).not.toContain('private-name.pdf');
+    expect(test.releases()).toBe(1);
+  });
+
+  it('redacts local paths in protocol errors', async () => {
+    const test = fixture([['private-name.pdf']]);
+    const events: unknown[] = [];
+    const captured = await captureFilePaths(async (method, params) => {
+      if (method === 'DOM.getFileInfo') throw new Error('Cannot read C:\\private\\private-name.pdf');
+      return test.cdp(method, params);
+    }, test.snapshot, (event, details) => events.push({ event, details }));
+    expect(JSON.stringify(events)).not.toContain('private-name.pdf');
+    expect(JSON.stringify(captured.fields[0].unavailableReason)).not.toContain('private-name.pdf');
+  });
+
+  it.each(['Runtime.evaluate', 'Runtime.getProperties'])('reports JavaScript exceptions at %s', async (stage) => {
+    const test = fixture([['first.pdf']]);
+    const events: Array<{ event: string; details?: Record<string, unknown> }> = [];
+    const captured = await captureFilePaths(async (method, params) => method === stage ? { result: {}, exceptionDetails: { text: 'Error' } } : test.cdp(method, params), test.snapshot, (event, details) => events.push({ event, details }));
+    expect(captured.fields[0].unavailableReason).toContain(stage);
+    expect(events.find(({ event }) => event === 'file.capture.error')?.details).toMatchObject({ stage });
+    expect(test.fileInfoCalls).toEqual([]);
+    expect(test.releases()).toBe(1);
+  });
+
+  it('diagnoses missing file objects separately from an empty path', async () => {
+    const test = fixture([['first.pdf']]);
+    const captured = await captureFilePaths(async (method, params) => method === 'Runtime.getProperties' ? { result: [{ name: '0', get: { objectId: 'getter' } }] } : test.cdp(method, params), test.snapshot);
+    expect(captured.fields[0].unavailableReason).toContain('all selected File objects');
+    expect(test.fileInfoCalls).toEqual([]);
+  });
+
+  it('logs successful capture without disclosing names or paths', async () => {
+    const test = fixture([['private-name.pdf']]);
+    const events: Array<{ event: string; details?: Record<string, unknown> }> = [];
+    await captureFilePaths(test.cdp, test.snapshot, (event, details) => events.push({ event, details }));
+    expect(events.find(({ event }) => event === 'file.capture.complete')?.details).toMatchObject({ fileCount: 1, capturedPathCount: 1 });
+    expect(JSON.stringify(events)).not.toContain('private-name.pdf');
+    expect(JSON.stringify(events)).not.toContain('uploads');
   });
 });

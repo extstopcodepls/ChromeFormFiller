@@ -4,7 +4,55 @@ import type { SavedFilling } from '../src/types';
 
 const form = { origin: 'https://example.test', pathname: '/', formId: 'main', formName: '', actionOrigin: 'https://example.test', actionPath: '/', method: 'POST', fingerprint: 'form', formIndex: 0 };
 
+function fileFilling(path?: string): SavedFilling {
+  return { id: 'entry', schemaVersion: 1, name: 'Test', form, fields: [{ descriptor: { key: 'file-field', kind: 'file', name: 'attachment', id: 'attachment', label: 'Attachment', index: 0 }, value: { tag: 'file', files: [{ name: 'private-name.pdf', path }] }, included: true }], createdAt: 1, updatedAt: 1 };
+}
+function fileCdp(calls: string[], setError?: string) {
+  return async (method: string, params?: Record<string, unknown>): Promise<any> => {
+    calls.push(method);
+    if (method === 'Runtime.evaluate') return params?.returnByValue === false ? { result: { objectId: 'input' } } : { result: { value: { files: [] } } };
+    if (method === 'DOM.requestNode') return { nodeId: 1 };
+    if (method === 'DOM.setFileInputFiles' && setError) throw new Error(setError);
+    return {};
+  };
+}
+
 describe('CDP replay', () => {
+  it('explains that old entries must be saved again when no path was captured', async () => {
+    const calls: string[] = [];
+    const events: Array<{ event: string; details?: Record<string, unknown> }> = [];
+    const result = await replay(fileCdp(calls), fileFilling(), () => false, (event, details) => events.push({ event, details }));
+    expect(result.fields[0]).toMatchObject({ status: 'manual' });
+    expect(result.fields[0].message).toContain('save the form again');
+    expect(events.find(({ event }) => event === 'file.replay.paths')?.details).toMatchObject({ fileCount: 1, reusablePathCount: 0, pathStatuses: ['missing'] });
+    expect(calls).not.toContain('DOM.setFileInputFiles');
+    expect(JSON.stringify(events)).not.toContain('private-name.pdf');
+  });
+
+  it('reports disabled extension file access before setting a stored file path', async () => {
+    const calls: string[] = [];
+    const result = await replay(fileCdp(calls), fileFilling('C:\\private\\private-name.pdf'), () => false, undefined, false, false);
+    expect(result.fields[0].status).toBe('manual');
+    expect(result.fields[0].message).toContain('Allow access to file URLs');
+    expect(calls).not.toContain('DOM.setFileInputFiles');
+  });
+
+  it('reports CDP permission denial with recovery instructions when the preflight is unavailable', async () => {
+    const calls: string[] = [];
+    const result = await replay(fileCdp(calls, '{"code":-32000,"message":"Not allowed"}'), fileFilling('C:\\private\\private-name.pdf'), () => false);
+    expect(calls).toContain('DOM.setFileInputFiles');
+    expect(result.fields[0].status).toBe('manual');
+    expect(result.fields[0].message).toContain('Allow access to file URLs');
+    expect(JSON.stringify(result)).not.toContain('private-name.pdf');
+  });
+
+  it('rejects fake paths from legacy entries', async () => {
+    const calls: string[] = [];
+    const result = await replay(fileCdp(calls), fileFilling('C:\\fakepath\\private-name.pdf'), () => false);
+    expect(result.fields[0].status).toBe('manual');
+    expect(calls).not.toContain('DOM.setFileInputFiles');
+  });
+
   it('falls back to the backend node id for file inputs when requestNode returns zero', async () => {
     const calls: string[] = [];
     const cdp = async (method: string, params?: Record<string, unknown>): Promise<any> => {
