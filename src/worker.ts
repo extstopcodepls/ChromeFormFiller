@@ -14,6 +14,7 @@ const DRAFT_TTL = 15 * 60 * 1000;
 const MAX_CAPTURE = 1024 * 1024;
 const PENDING_ENABLE_KEY = 'pendingEnableOrigin';
 let dataKey: Uint8Array | undefined;
+let vaultStateQueue: Promise<unknown> = Promise.resolve();
 const cancelTabs = new Set<number>();
 const queues = new Map<number, Promise<unknown>>();
 const originRegistrations = new Map<string, Promise<void>>();
@@ -39,14 +40,21 @@ function fieldWithWait(field: SavedFilling['fields'][number], waits: Record<stri
 }
 function serializedFieldSummary(field: SavedFilling['fields'][number], fieldIndex: number): Record<string, unknown> { return { fieldIndex, resultKey: field.descriptor.key, kind: field.descriptor.kind, included: field.included, matchKeys: fieldMatchKeys(field.descriptor) }; }
 async function enabled(origin: string): Promise<boolean> { return (await getConfig()).enabledOrigins.includes(origin); }
-async function touch(): Promise<void> { const now = Date.now(); await setSession({ [ACTIVITY_KEY]: now }); }
-async function unlocked(): Promise<boolean> {
+// Key, activity, and lock broadcasts must change together. A status check must
+// not expire a key while its unlock is still being written to session storage.
+function withVaultState<T>(operation: () => Promise<T>): Promise<T> {
+  const current = vaultStateQueue.then(operation);
+  vaultStateQueue = current.catch(() => undefined);
+  return current;
+}
+async function unlockedNow(): Promise<boolean> {
   const last = await getSession<number>(ACTIVITY_KEY);
   if (dataKey && last && Date.now() - last < LOCK_AFTER) return true;
-  if (dataKey) await lockVault();
+  if (dataKey) await lockVaultNow();
   return false;
 }
-async function requireKey(): Promise<Uint8Array> { if (!(await unlocked()) || !dataKey) throw new Error('Unlock the vault to save or fill.'); await touch(); return dataKey; }
+async function unlocked(): Promise<boolean> { return withVaultState(unlockedNow); }
+async function requireKey(): Promise<Uint8Array> { return withVaultState(async () => { if (!(await unlockedNow()) || !dataKey) throw new Error('Unlock the vault to save or fill.'); await setSession({ [ACTIVITY_KEY]: Date.now() }); return dataKey; }); }
 async function allEntries(key: Uint8Array): Promise<SavedFilling[]> {
   const ids = await getEntryIds(); const entries: SavedFilling[] = [];
   for (const id of ids) { const envelope = await getEntryEnvelope(id); if (!envelope) continue; try { entries.push(await decryptRecord<SavedFilling>(key, envelope)); } catch { /* Corrupt records are skipped and remain recoverable for deletion. */ } }
@@ -181,9 +189,11 @@ async function handle(message: Message, sender: chrome.runtime.MessageSender): P
     if (!senderOrigin) throw new Error('No enabled site is active.'); const config = await getConfig(); config.enabledOrigins = config.enabledOrigins.filter((item) => item !== senderOrigin); await setConfig(config); if (dataKey && await unlocked()) await deleteDraftsForOrigin(dataKey, senderOrigin); await unregisterOrigin(senderOrigin); return { ok: true, status: await getSiteStatus(tabId, tabUrl) };
   }
   if (message.type === 'UNLOCK_VAULT') {
-    if (!message.passphrase || message.passphrase.length < 8) throw new Error('Use a passphrase of at least 8 characters.');
-    const existing = await getVaultMeta(); let raw: Uint8Array; if (!existing) { const created = await createVault(message.passphrase); await setVaultMeta(created.meta); raw = created.dataKey; } else raw = await unlockVault(message.passphrase, existing);
-    dataKey = raw; await setSession({ [SESSION_KEY]: toSessionKey(raw), [ACTIVITY_KEY]: Date.now() }); await broadcast({ type: 'VAULT_STATE', unlocked: true }); return { ok: true, message: 'Vault unlocked.' };
+    return withVaultState(async () => {
+      if (!message.passphrase || message.passphrase.length < 8) throw new Error('Use a passphrase of at least 8 characters.');
+      const existing = await getVaultMeta(); let raw: Uint8Array; if (!existing) { const created = await createVault(message.passphrase); await setVaultMeta(created.meta); raw = created.dataKey; } else raw = await unlockVault(message.passphrase, existing);
+      await setSession({ [SESSION_KEY]: toSessionKey(raw), [ACTIVITY_KEY]: Date.now() }); dataKey = raw; await broadcast({ type: 'VAULT_STATE', unlocked: true }); return { ok: true, message: 'Vault unlocked.' };
+    });
   }
   if (message.type === 'LOCK_VAULT') { await lockVault(); return { ok: true, message: 'Vault locked.' }; }
   if (message.type === 'OPEN_LIBRARY') { await chrome.tabs.create({ url: chrome.runtime.getURL(`library.html${message.draftId ? `?draft=${encodeURIComponent(message.draftId)}` : ''}`) }); return { ok: true, requestId: message.requestId }; }
@@ -231,13 +241,14 @@ async function handle(message: Message, sender: chrome.runtime.MessageSender): P
   throw new Error('Unsupported operation.');
 }
 
-async function lockVault(): Promise<void> { dataKey = undefined; await chrome.storage.session.clear(); await broadcast({ type: 'VAULT_STATE', unlocked: false }); }
+async function lockVault(): Promise<void> { return withVaultState(lockVaultNow); }
+async function lockVaultNow(): Promise<void> { dataKey = undefined; await chrome.storage.session.clear(); await broadcast({ type: 'VAULT_STATE', unlocked: false }); }
 function installListeners(): void {
   chrome.runtime.onMessage.addListener((raw, sender, sendResponse) => { if (!isMessage(raw)) { sendResponse({ ok: false, error: 'Invalid message.' }); return false; } void handle(raw, sender).then((response) => sendResponse(response)).catch((error) => sendResponse({ ok: false, requestId: raw.requestId, error: error instanceof Error ? error.message : 'Operation failed.' })); return true; });
   chrome.runtime.onStartup.addListener(() => { void reconcile(); }); chrome.runtime.onInstalled.addListener(() => { void reconcile(); });
   chrome.permissions.onAdded.addListener((permissions) => { void finishPendingEnable(permissions.origins ?? []); });
   chrome.permissions.onRemoved.addListener((permissions) => { for (const removedPattern of permissions.origins ?? []) { void (async () => { const config = await getConfig(); const removed = config.enabledOrigins.filter((item) => permissionPattern(item) === removedPattern); config.enabledOrigins = config.enabledOrigins.filter((item) => !removed.includes(item)); await setConfig(config); for (const origin of removed) await unregisterOrigin(origin); })(); } });
   chrome.tabs.onRemoved.addListener((tabId) => { cancelTabs.add(tabId); }); chrome.debugger.onDetach.addListener(({ tabId }) => { if (tabId !== undefined) cancelTabs.add(tabId); });
-  chrome.alarms.create('form-filler-maintenance', { periodInMinutes: 5 }); chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === 'form-filler-maintenance') void (async () => { if (dataKey && !(await unlocked())) return; if (dataKey) await pendingDrafts(dataKey); })(); });
+  chrome.alarms.create('form-filler-maintenance', { periodInMinutes: 5 }); chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === 'form-filler-maintenance') void (async () => { await workerReady; if (dataKey && !(await unlocked())) return; if (dataKey) await pendingDrafts(dataKey); })(); });
 }
 installListeners();

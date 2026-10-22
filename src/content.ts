@@ -221,11 +221,12 @@ function handleSubmit(event: Event): void {
   void observe();
 }
 async function boot(): Promise<void> {
+  let receivedVaultState = false;
+  chrome.runtime.onMessage.addListener((message) => { if (message?.type === 'DEBUG_STATE') { debugEnabled = !!message.enabled; debugLog('debug.enabled', { enabled: debugEnabled }); return; } if (message?.type === 'VAULT_STATE') { receivedVaultState = true; vaultUnlocked = !!message.unlocked; debugLog('vault.state', { unlocked: vaultUnlocked }); for (const controller of controllers.values()) { renderMenu(controller); if (!vaultUnlocked) setStatus(controller, 'Vault locked.'); } } });
   document.addEventListener('submit', handleSubmit, true);
-  const initial = await request<any>({ type: 'GET_SITE_STATUS', requestId: newRequestId() }); if (!initial.ok || !initial.status?.enabled) return; vaultUnlocked = !!initial.status.unlocked; debugEnabled = !!initial.status.debug; debugLog('boot', { origin: location.origin, formCount: document.forms.length, vaultUnlocked }); discover(); void showPendingSubmissionPrompt();
+  const initial = await request<any>({ type: 'GET_SITE_STATUS', requestId: newRequestId() }); if (!initial.ok || !initial.status?.enabled) return; if (!receivedVaultState) vaultUnlocked = !!initial.status.unlocked; debugEnabled = !!initial.status.debug; debugLog('boot', { origin: location.origin, formCount: document.forms.length, vaultUnlocked }); discover(); void showPendingSubmissionPrompt();
   const observer = new MutationObserver(() => { window.clearTimeout((observer as any)._timer); (observer as any)._timer = window.setTimeout(discover, 150); }); observer.observe(document.documentElement, { childList: true, subtree: true });
   addEventListener('scroll', () => { for (const controller of controllers.values()) position(controller); }, { passive: true }); addEventListener('resize', () => { for (const controller of controllers.values()) position(controller); });
   document.addEventListener('input', () => { revision += 1; }, true); document.addEventListener('change', () => { revision += 1; }, true);
-  chrome.runtime.onMessage.addListener((message) => { if (message?.type === 'DEBUG_STATE') { debugEnabled = !!message.enabled; debugLog('debug.enabled', { enabled: debugEnabled }); return; } if (message?.type === 'VAULT_STATE') { vaultUnlocked = !!message.unlocked; debugLog('vault.state', { unlocked: vaultUnlocked }); for (const controller of controllers.values()) { renderMenu(controller); if (!vaultUnlocked) setStatus(controller, 'Vault locked.'); } } });
 }
 })();
