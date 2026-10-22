@@ -112,26 +112,34 @@ async function describe(cdp: Cdp, field: CapturedField, form: FormIdentity): Pro
 export async function captureFilePaths(cdp: Cdp, snapshot: FormSnapshot): Promise<FormSnapshot> {
   const fields = snapshot.fields.map((field) => ({ ...field, value: field.value.tag === 'file' ? { ...field.value, files: field.value.files.map((file) => ({ ...file })) } : field.value }));
   for (const field of fields) {
-    if (field.descriptor.kind !== 'file' || field.value.tag !== 'file' || !field.value.files.length) continue;
+    if (field.descriptor.kind !== 'file' || field.value.tag !== 'file') continue;
+    if (!field.value.files.length) { delete field.unavailableReason; continue; }
     try {
-      const evaluated = await cdp('Runtime.evaluate', { expression: guardedLocator(field, snapshot.form), objectGroup: 'form-filler-file-capture', returnByValue: false });
-      const inputObjectId = evaluated.result?.objectId;
-      if (!inputObjectId) continue;
-      const inputProperties = await cdp('Runtime.getProperties', { objectId: inputObjectId, ownProperties: false });
-      const filesProperty = inputProperties.result?.find((property: any) => property.name === 'files')?.value?.objectId;
-      if (!filesProperty) continue;
-      const fileListProperties = await cdp('Runtime.getProperties', { objectId: filesProperty, ownProperties: false });
-      const fileObjects = fileListProperties.result?.filter((property: any) => /^\d+$/.test(property.name)).map((property: any) => property.value?.objectId).filter(Boolean) ?? [];
+      // `files` is a native accessor, so getProperties(input) may return a
+      // getter descriptor rather than a value. Evaluate it explicitly and
+      // retain a stable array while the asynchronous CDP requests run.
+      const expected = JSON.stringify(field.value.files.map(({ name, size, lastModified }) => ({ name, size, lastModified })));
+      const expression = `(function(){const e=${guardedLocator(field, snapshot.form)};if(!e)return null;const files=Array.from(e.files||[]);const expected=${expected};if(files.length!==expected.length||files.some((file,index)=>{const saved=expected[index];return file.name!==saved.name||(saved.size!==undefined&&file.size!==saved.size)||(saved.lastModified!==undefined&&file.lastModified!==saved.lastModified)}))return null;return files})()`;
+      const evaluated = await cdp('Runtime.evaluate', { expression, objectGroup: 'form-filler-file-capture', returnByValue: false });
+      const filesObjectId = evaluated.result?.objectId;
+      if (!filesObjectId) continue;
+      const fileListProperties = await cdp('Runtime.getProperties', { objectId: filesObjectId, ownProperties: true });
+      const fileObjects = fileListProperties.result?.filter((property: any) => /^\d+$/.test(property.name)).sort((a: any, b: any) => Number(a.name) - Number(b.name)).map((property: any) => property.value?.objectId) ?? [];
+      if (fileObjects.length !== field.value.files.length || fileObjects.some((objectId: unknown) => typeof objectId !== 'string')) continue;
       const captured = [] as Array<{ path: string; name: string; size?: number; lastModified?: number }>;
       for (const fileObjectId of fileObjects) {
         const info = await cdp('DOM.getFileInfo', { objectId: fileObjectId });
         const path = typeof info?.path === 'string' ? info.path : '';
         if (/^(?:[A-Za-z]:\\|\\\\)/.test(path)) captured.push({ path, name: field.value.files[captured.length]?.name ?? 'file', size: field.value.files[captured.length]?.size, lastModified: field.value.files[captured.length]?.lastModified });
       }
-      if (captured.length === field.value.files.length) field.value.files = captured;
-      await cdp('Runtime.releaseObject', { objectId: inputObjectId }).catch(() => undefined);
+      if (captured.length === field.value.files.length) {
+        field.value.files = captured;
+        delete field.unavailableReason;
+      }
     } catch {
       // DOM.getFileInfo is experimental. Preserve the metadata and require reselection.
+    } finally {
+      await cdp('Runtime.releaseObjectGroup', { objectGroup: 'form-filler-file-capture' }).catch(() => undefined);
     }
   }
   return { ...snapshot, fields };
