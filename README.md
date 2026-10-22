@@ -15,7 +15,7 @@ pnpm test
 
 Load the generated `dist` directory with **chrome://extensions → Developer mode → Load unpacked**. The extension targets desktop Chrome 120+ on Windows. It is intentionally limited to top-level ordinary HTML forms. Passwords, payment credentials, OTP-like controls, shadow DOM, iframes, custom widgets, and contenteditable editors are excluded in v1.
 
-The first vault unlock creates a local vault. There is no passphrase recovery. Saved names, form identities, values, and file metadata are encrypted locally; no plaintext values or file bytes are uploaded. File selections without a reusable local path are surfaced for manual reselection.
+The first vault unlock creates a local vault. There is no passphrase recovery. Saved names, form identities, values, file metadata, and per-filling wait settings are encrypted locally; no plaintext values or file bytes are uploaded. File selections without a reusable local path are surfaced for manual reselection. A saved filling can configure a default wait in milliseconds after each included field is set and verified, with optional per-field overrides.
 
 ## Debugging filling
 

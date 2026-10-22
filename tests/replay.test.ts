@@ -41,6 +41,43 @@ describe('CDP replay', () => {
     expect(calls.every((method) => !method.startsWith('Input.') && method !== 'DOM.focus')).toBe(true);
   });
 
+  it('includes the field label in a failed fill result', async () => {
+    const cdp = async (): Promise<any> => ({ result: { value: false } });
+    const filling: SavedFilling = { id: 'entry', schemaVersion: 1, name: 'Test', form, fields: [{ descriptor: { key: 'text|email|email|0', kind: 'text', name: 'email', id: 'email', label: 'Work email', index: 0, typeSignature: 'text|email|email', formId: 'main' }, value: { tag: 'text', value: 'new@example.test' }, included: true }], createdAt: 1, updatedAt: 1 };
+    const result = await replay(cdp, filling, () => false);
+    expect(result.fields[0]).toMatchObject({ fieldName: 'Work email', status: 'failed' });
+  });
+
+  it('waits after the complete filling has been verified', async () => {
+    const events: string[] = [];
+    const cdp = async (method: string, params?: Record<string, unknown>): Promise<any> => {
+      const expression = String(params?.expression ?? '');
+      if (method === 'Runtime.evaluate' && expression.includes("fire('input')")) return { result: { value: true } };
+      if (method === 'Runtime.evaluate') return { result: { value: { value: 'new value', checked: false } } };
+      return {};
+    };
+    const filling: SavedFilling = { id: 'entry', schemaVersion: 1, name: 'Test', form, waitAfterFillMs: 20, fields: [{ descriptor: { key: 'text|name|name|0', kind: 'text', name: 'name', id: 'name', label: 'Name', index: 0, typeSignature: 'text|name|name', formId: 'main' }, value: { tag: 'text', value: 'new value' }, included: true }], createdAt: 1, updatedAt: 1 };
+    const result = await replay(cdp, filling, () => false, (event) => events.push(event));
+    expect(result.status).toBe('completed');
+    expect(events.indexOf('field.filled')).toBeLessThan(events.indexOf('wait.start'));
+    expect(events.indexOf('wait.start')).toBeLessThan(events.indexOf('wait.complete'));
+  });
+
+  it('uses a field wait override instead of the filling default', async () => {
+    const waits: number[] = [];
+    const cdp = async (method: string, params?: Record<string, unknown>): Promise<any> => {
+      const expression = String(params?.expression ?? '');
+      if (method === 'Runtime.evaluate' && expression.includes("fire('input')")) return { result: { value: true } };
+      if (method === 'Runtime.evaluate') return { result: { value: { value: 'new value', checked: false } } };
+      return {};
+    };
+    const field = (key: string, index: number): SavedFilling['fields'][number] => ({ descriptor: { key, kind: 'text', name: key, id: key, label: key, index, typeSignature: `text|${key}|${key}` }, value: { tag: 'text', value: 'new value' }, included: true });
+    const filling: SavedFilling = { id: 'entry', schemaVersion: 1, name: 'Test', form, waitAfterFillMs: 1, fields: [{ ...field('first', 0) }, { ...field('second', 1), waitAfterFillMs: 5 }], createdAt: 1, updatedAt: 1 };
+    const result = await replay(cdp, filling, () => false, (event, details) => { if (event === 'wait.start') waits.push(details?.delayMs as number); });
+    expect(result.status).toBe('completed');
+    expect(waits).toEqual([1, 5]);
+  });
+
   it('logs every locator criterion without logging the saved value', async () => {
     const events: Array<{ event: string; details?: Record<string, unknown> }> = [];
     const cdp = async (method: string, params?: Record<string, unknown>): Promise<any> => {

@@ -1,5 +1,6 @@
 import type { CapturedField, FillFieldResult, FillResult, FormIdentity, FormSnapshot, SavedFilling } from './types';
 import { fieldMatchKeys } from './matching';
+import { normalizeWaitAfterFillMs, waitAfterFill } from './delay';
 
 type Cdp = (method: string, params?: Record<string, unknown>) => Promise<any>;
 type ReplayLogger = (event: string, details?: Record<string, unknown>) => void;
@@ -62,7 +63,22 @@ function locatorTraceExpression(field: CapturedField, form: FormIdentity): strin
   })()`;
 }
 function isText(kind: string): boolean { return ['text','search','email','url','tel','textarea','number','range','date','time','month','week','datetime-local'].includes(kind); }
+function displayFieldName(field: CapturedField, fieldIndex: number): string {
+  return field.descriptor.label.trim() || field.descriptor.name.trim() || field.descriptor.id.trim() || `${field.descriptor.kind} field ${fieldIndex + 1}`;
+}
+function fieldResult(field: CapturedField, fieldIndex: number, status: FillFieldResult['status'], message?: string): FillFieldResult {
+  return { key: field.descriptor.key, fieldName: displayFieldName(field, fieldIndex), status, message };
+}
 function result(status: FillResult['status'], fields: FillFieldResult[], message?: string): FillResult { return { status, fields, message }; }
+async function waitAfterVerifiedField(field: CapturedField, filling: SavedFilling, fieldIndex: number, isCanceled: () => boolean, log: ReplayLogger): Promise<boolean> {
+  const waitMs = normalizeWaitAfterFillMs(field.waitAfterFillMs, normalizeWaitAfterFillMs(filling.waitAfterFillMs));
+  if (waitMs === 0) return true;
+  log('wait.start', { fieldIndex, delayMs: waitMs, overridden: field.waitAfterFillMs !== undefined });
+  const completed = await waitAfterFill(waitMs, isCanceled);
+  if (!completed) { log('wait.canceled', { fieldIndex, delayMs: waitMs }); return false; }
+  log('wait.complete', { fieldIndex, delayMs: waitMs });
+  return true;
+}
 
 async function nodeFor(cdp: Cdp, field: CapturedField, form: FormIdentity): Promise<number | undefined> {
   const evaluated = await cdp('Runtime.evaluate', { expression: guardedLocator(field, form), objectGroup: 'form-filler', returnByValue: false, awaitPromise: false });
@@ -177,7 +193,7 @@ export async function replay(cdp: Cdp, filling: SavedFilling, isCanceled: () => 
   log('start', { entryId: filling.id, fieldCount: includedFields.length });
   for (const [fieldIndex, field] of includedFields.entries()) {
     log('field.start', { fieldIndex, resultKey: field.descriptor.key, kind: field.descriptor.kind, serializedKeys: fieldMatchKeys(field.descriptor) });
-    if (isCanceled()) { fields.push({ key: field.descriptor.key, status: 'canceled' }); return result('canceled', fields); }
+    if (isCanceled()) { fields.push(fieldResult(field, fieldIndex, 'canceled')); return result('canceled', fields); }
     if (Date.now() > deadline) return result('partial', fields, 'The two-minute replay limit was reached.');
     const kind = field.descriptor.kind;
     try {
@@ -189,35 +205,38 @@ export async function replay(cdp: Cdp, filling: SavedFilling, isCanceled: () => 
       const value = field.value;
       if (kind === 'file') {
         const nodeId = await nodeFor(cdp, field, filling.form);
-        if (!nodeId) { const message = 'Control could not be resolved inside the saved form.'; log('field.missing', { fieldIndex, reason: message }); fields.push({ key: field.descriptor.key, status: 'missing', message }); continue; }
+        if (!nodeId) { const message = 'Control could not be resolved inside the saved form.'; log('field.missing', { fieldIndex, reason: message }); fields.push(fieldResult(field, fieldIndex, 'missing', message)); continue; }
         const files = field.value.tag === 'file' ? field.value.files : [];
         const paths = files.map((file) => file.path).filter((path): path is string => typeof path === 'string' && /^(?:[A-Za-z]:\\|\\\\)/.test(path));
-        if (paths.length !== files.length) { const message = 'File reselection is required because Chrome did not expose a reusable local path.'; log('field.manual', { fieldIndex, reason: message }); fields.push({ key: field.descriptor.key, status: 'manual', message }); continue; }
+        if (paths.length !== files.length) { const message = 'File reselection is required because Chrome did not expose a reusable local path.'; log('field.manual', { fieldIndex, reason: message }); fields.push(fieldResult(field, fieldIndex, 'manual', message)); continue; }
         await cdp('DOM.setFileInputFiles', { nodeId, files: paths });
         const afterFiles = (await describe(cdp, field, filling.form))?.files ?? [];
         const wantedFiles = files.map((file) => file.name);
-        fields.push({ key: field.descriptor.key, status: JSON.stringify(afterFiles) === JSON.stringify(wantedFiles) ? 'filled' : 'failed', message: JSON.stringify(afterFiles) === JSON.stringify(wantedFiles) ? undefined : 'The selected file list could not be verified.' });
+        const verified = JSON.stringify(afterFiles) === JSON.stringify(wantedFiles);
+        fields.push(fieldResult(field, fieldIndex, verified ? 'filled' : 'failed', verified ? undefined : 'The selected file list could not be verified.'));
+        if (verified && !await waitAfterVerifiedField(field, filling, fieldIndex, isCanceled, log)) return result('canceled', fields, 'Filling canceled during the configured wait.');
         continue;
       }
       if (kind === 'radio' && value.tag === 'radio' && value.value === null) {
         const message = 'No selection was saved for this radio option.';
         log('field.unchanged', { fieldIndex, reason: message });
-        fields.push({ key: field.descriptor.key, status: 'unchanged', message });
+        fields.push(fieldResult(field, fieldIndex, 'unchanged', message));
         continue;
       }
       if (!isText(kind) && kind !== 'checkbox' && kind !== 'radio' && kind !== 'select-one' && kind !== 'select-multiple' && kind !== 'color') {
-        const message = 'This control is not supported by the DOM adapter.'; log('field.manual', { fieldIndex, reason: message }); fields.push({ key: field.descriptor.key, status: 'manual', message });
+        const message = 'This control is not supported by the DOM adapter.'; log('field.manual', { fieldIndex, reason: message }); fields.push(fieldResult(field, fieldIndex, 'manual', message));
         continue;
       }
       if (!await setControlValue(cdp, field, filling.form)) {
-        const message = 'The control could not be set through the page DOM.'; log('field.failed', { fieldIndex, reason: message }); fields.push({ key: field.descriptor.key, status: 'failed', message }); continue;
+        const message = 'The control could not be set through the page DOM.'; log('field.failed', { fieldIndex, reason: message }); fields.push(fieldResult(field, fieldIndex, 'failed', message)); continue;
       }
       const after = await describe(cdp, field, filling.form);
       const wanted = value.tag === 'boolean' ? String(value.value) : value.tag === 'radio' ? value.value ?? '' : value.tag === 'options' ? JSON.stringify(value.values) : value.tag === 'text' ? value.value : JSON.stringify(value);
       const actual = kind === 'checkbox' ? String(after?.checked) : kind === 'radio' ? (after?.checked ? after.value : '') : kind === 'select-one' || kind === 'select-multiple' ? JSON.stringify(after?.selected ?? []) : after?.value ?? '';
-      const status = actual === wanted ? 'filled' : 'failed'; const message = status === 'filled' ? undefined : 'DOM update completed, but verification reported a different value.'; log(`field.${status}`, { fieldIndex, reason: message }); fields.push({ key: field.descriptor.key, status, message });
+      const verified = actual === wanted; const status = verified ? 'filled' : 'failed'; const message = status === 'filled' ? undefined : 'DOM update completed, but verification reported a different value.'; log(`field.${status}`, { fieldIndex, reason: message }); fields.push(fieldResult(field, fieldIndex, status, message));
+      if (verified && !await waitAfterVerifiedField(field, filling, fieldIndex, isCanceled, log)) return result('canceled', fields, 'Filling canceled during the configured wait.');
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Replay failed.'; log('field.failed', { fieldIndex, reason: safeDebugReason(message) }); fields.push({ key: field.descriptor.key, status: 'failed', message });
+      const message = error instanceof Error ? error.message : 'Replay failed.'; log('field.failed', { fieldIndex, reason: safeDebugReason(message) }); fields.push(fieldResult(field, fieldIndex, 'failed', message));
     }
   }
   const status = fields.some((f) => ['missing','manual','failed'].includes(f.status)) ? 'partial' : 'completed';

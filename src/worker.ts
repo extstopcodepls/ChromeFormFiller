@@ -3,6 +3,7 @@ import { isMessage } from './messages';
 import { createVault, decryptRecord, encryptRecord, fromSessionKey, toSessionKey, unlockVault, type Envelope, type VaultMeta } from './crypto';
 import { deleteDraftEnvelope, deleteEntryEnvelope, getConfig, getDraftEnvelope, getDraftIds, getEntryEnvelope, getEntryIds, getSession, getVaultMeta, removeLocal, setConfig, setDraftEnvelope, setDraftIds, setEntryEnvelope, setEntryIds, setSession, setVaultMeta } from './storage';
 import { explainSnapshotMatch, fieldMatchKeys, matchesForForm, matchesForSnapshot, suggestedName, sameForm } from './matching';
+import { normalizeWaitAfterFillMs, normalizeWaitAfterFillOverrideMs } from './delay';
 import { captureFilePaths, replay } from './replay';
 import type { FieldValue, FormSnapshot, PendingDraft, SavedFilling, SiteStatus } from './types';
 
@@ -31,6 +32,11 @@ function valueMatchesKind(kind: SavedFilling['fields'][number]['descriptor']['ki
   if (kind === 'file') return value.tag === 'file';
   return value.tag === 'text';
 }
+function fieldWithWait(field: SavedFilling['fields'][number], waits: Record<string, number | null> | undefined): SavedFilling['fields'][number] {
+  if (!waits || !Object.prototype.hasOwnProperty.call(waits, field.descriptor.key)) return field;
+  const waitAfterFillMs = normalizeWaitAfterFillOverrideMs(waits[field.descriptor.key]);
+  return waitAfterFillMs === undefined ? { ...field, waitAfterFillMs: undefined } : { ...field, waitAfterFillMs };
+}
 function serializedFieldSummary(field: SavedFilling['fields'][number], fieldIndex: number): Record<string, unknown> { return { fieldIndex, resultKey: field.descriptor.key, kind: field.descriptor.kind, included: field.included, matchKeys: fieldMatchKeys(field.descriptor) }; }
 async function enabled(origin: string): Promise<boolean> { return (await getConfig()).enabledOrigins.includes(origin); }
 async function touch(): Promise<void> { const now = Date.now(); await setSession({ [ACTIVITY_KEY]: now }); }
@@ -50,6 +56,11 @@ async function pendingDrafts(key: Uint8Array): Promise<PendingDraft[]> {
   const ids = await getDraftIds(); const keep: string[] = []; const drafts: PendingDraft[] = [];
   for (const id of ids) { const envelope = await getDraftEnvelope(id); if (!envelope) continue; try { const draft = await decryptRecord<PendingDraft>(key, envelope); if (draft.expiresAt > Date.now()) { keep.push(id); drafts.push(draft); } else await deleteDraftEnvelope(id); } catch { await deleteDraftEnvelope(id); } }
   if (keep.length !== ids.length) await setDraftIds(keep); return drafts;
+}
+async function pendingSubmissionForTab(key: Uint8Array, tabId: number | undefined, origin: string | undefined): Promise<PendingDraft | undefined> {
+  if (tabId === undefined) return undefined;
+  const drafts = await pendingDrafts(key);
+  return drafts.find((draft) => draft.submissionObserved && draft.sourceTabId === tabId && (!origin || draft.form.origin === origin));
 }
 async function saveDraft(snapshot: FormSnapshot, tabId: number | undefined, submissionObserved: boolean): Promise<string> {
   const key = await requireKey();
@@ -122,7 +133,15 @@ async function captureSnapshot(tabId: number | undefined, snapshot: FormSnapshot
   finally { await chrome.debugger.detach({ tabId }).catch(() => undefined); }
 }
 
+const workerReady = (async () => {
+  const stored = await getSession<string>(SESSION_KEY);
+  if (stored) dataKey = fromSessionKey(stored);
+  await reconcile();
+  await finishPendingEnable();
+})();
+
 async function handle(message: Message, sender: chrome.runtime.MessageSender): Promise<Response> {
+  await workerReady;
   const tabId = sender.tab?.id; const tabUrl = sender.tab?.url ?? ('tabUrl' in message ? message.tabUrl : undefined); const senderOrigin = originFromUrl(tabUrl);
   if (message.type === 'GET_SITE_STATUS') return { ok: true, requestId: message.requestId, status: await getSiteStatus(tabId, tabUrl) };
   if (message.type === 'SET_DEBUG') { const config = await getConfig(); config.debug = message.enabled; await setConfig(config); await setSession({ debug: message.enabled }); await broadcast({ type: 'DEBUG_STATE', enabled: message.enabled }); console.info('[Form Filler][worker]', 'debug state changed', { enabled: message.enabled }); return { ok: true, requestId: message.requestId, status: await getSiteStatus(tabId, tabUrl) }; }
@@ -145,6 +164,7 @@ async function handle(message: Message, sender: chrome.runtime.MessageSender): P
   if (message.type === 'OPEN_LIBRARY') { await chrome.tabs.create({ url: chrome.runtime.getURL(`library.html${message.draftId ? `?draft=${encodeURIComponent(message.draftId)}` : ''}`) }); return { ok: true, requestId: message.requestId }; }
   if (message.type === 'CANCEL_FILL') { if (message.tabId !== undefined) cancelTabs.add(message.tabId); return { ok: true, requestId: message.requestId }; }
   const key = await requireKey();
+  if (message.type === 'GET_PENDING_SUBMISSION') { const draft = await pendingSubmissionForTab(key, tabId, message.origin ?? senderOrigin); return { ok: true, requestId: message.requestId, draftId: draft?.id, pendingForm: draft?.form }; }
   if (message.type === 'LIST_MATCHES') { if (sender.tab && (senderOrigin !== message.form.origin || !(await enabled(message.form.origin)))) throw new Error('This site is not authorized.'); const candidates = await allEntries(key); const current = message.fields ? { form: message.form, fields: message.fields, capturedAt: 0, revision: 0, completeness: 'complete' as const } : undefined; const matches = current ? matchesForSnapshot(candidates, current) : matchesForForm(candidates, message.form); if (current) { for (const candidate of candidates) await debugLog('match.candidate', { tabId, entryId: candidate.id, entryName: candidate.name, ...explainSnapshotMatch(candidate, current) }); } await debugLog('matches.listed', { tabId, formIndex: message.form.formIndex, fingerprint: message.form.fingerprint, candidateCount: candidates.length, count: matches.length, matchedEntryIds: matches.map((entry) => entry.id) }); return { ok: true, requestId: message.requestId, matches: matches.map((entry) => ({ id: entry.id, name: entry.name, lastUsedAt: entry.lastUsedAt, updatedAt: entry.updatedAt, fieldCount: entry.fields.filter((field) => field.included).length, preview: entry.fields.filter((field) => field.included).map((field) => ({ key: field.descriptor.key, label: field.descriptor.label || field.descriptor.name || field.descriptor.kind, kind: field.descriptor.kind, id: field.descriptor.id, name: field.descriptor.name, index: field.descriptor.index, matchKeys: fieldMatchKeys(field.descriptor), value: fieldSummary(field) })) })) }; }
   if (message.type === 'CAPTURE_FORM') { if (sender.tab && (senderOrigin !== message.form.form.origin || !(await enabled(message.form.form.origin)))) throw new Error('This site is not authorized.'); await debugLog('capture.requested', { tabId, formIndex: message.form.form.formIndex, fieldCount: message.form.fields.length, serializedFields: message.form.fields.map(serializedFieldSummary) }); const captured = tabId === undefined ? message.form : await withTabQueue(tabId, () => captureSnapshot(tabId, message.form)); const draftId = await saveDraft(captured, tabId, false); await debugLog('capture.completed', { tabId, formIndex: captured.form.formIndex, fieldCount: captured.fields.length, serializedFields: captured.fields.map(serializedFieldSummary) }); return { ok: true, requestId: message.requestId, draftId }; }
   if (message.type === 'SUBMISSION_OBSERVED') { if (sender.tab && (senderOrigin !== message.form.form.origin || !(await enabled(message.form.form.origin)))) throw new Error('This site is not authorized.'); await debugLog('submission.detected', { tabId, formIndex: message.form.form.formIndex, fieldCount: message.form.fields.length, serializedFields: message.form.fields.map(serializedFieldSummary) }); const config = await getConfig(); if (config.ignoredForms.includes(formKey(message.form.form))) { await debugLog('submission.ignored', { tabId, formIndex: message.form.form.formIndex }); return { ok: true, requestId: message.requestId, message: 'This form is ignored.' }; } const captured = tabId === undefined ? message.form : await withTabQueue(tabId, () => captureSnapshot(tabId, message.form)); const draftId = await saveDraft(captured, tabId, true); if (tabId !== undefined) await chrome.action.setBadgeText({ tabId, text: '?' }); await chrome.action.setBadgeBackgroundColor({ color: '#d97706' }).catch(() => undefined); await debugLog('submission.draft-created', { tabId, formIndex: captured.form.formIndex, serializedFields: captured.fields.map(serializedFieldSummary) }); return { ok: true, requestId: message.requestId, draftId }; }
@@ -156,13 +176,14 @@ async function handle(message: Message, sender: chrome.runtime.MessageSender): P
     let draft: PendingDraft | undefined; if (message.draftId) { const envelope = await getDraftEnvelope(message.draftId); if (!envelope) throw new Error('Draft expired.'); draft = await decryptRecord<PendingDraft>(key, envelope); }
     if (!draft && !message.filling) throw new Error('Nothing to save.');
     if (message.filling) throw new Error('Direct filling payloads are not accepted. Save a reviewed draft instead.');
-    const now = Date.now(); const filling: SavedFilling = { id: crypto.randomUUID(), schemaVersion: 1, name: message.name?.trim() || suggestedName(draft!.form, draft!.fields.length), form: draft!.form, fields: draft!.fields.map((field) => ({ ...field, included: !(message.excludedKeys ?? []).includes(field.descriptor.key) && field.included })), createdAt: now, updatedAt: now };
+    const now = Date.now(); const filling: SavedFilling = { id: crypto.randomUUID(), schemaVersion: 1, name: message.name?.trim() || suggestedName(draft!.form, draft!.fields.length), form: draft!.form, fields: draft!.fields.map((field) => fieldWithWait({ ...field, included: !(message.excludedKeys ?? []).includes(field.descriptor.key) && field.included }, message.fieldWaitAfterFillMs)), createdAt: now, updatedAt: now, waitAfterFillMs: normalizeWaitAfterFillMs(message.waitAfterFillMs) };
     if (!filling.name) throw new Error('Enter a name.');
     await setEntryEnvelope(filling.id, await encryptRecord(key, filling)); const ids = await getEntryIds(); if (!ids.includes(filling.id)) await setEntryIds([filling.id, ...ids]);
+    if (draft?.sourceTabId !== undefined) await chrome.action.setBadgeText({ tabId: draft.sourceTabId, text: '' });
     if (message.draftId) { await deleteDraftEnvelope(message.draftId); await setDraftIds((await getDraftIds()).filter((id) => id !== message.draftId)); }
     return { ok: true, requestId: message.requestId, filling };
   }
-  if (message.type === 'UPDATE_FILLING') { const envelope = await getEntryEnvelope(message.id); if (!envelope) throw new Error('Saved filling not found.'); const old = await decryptRecord<SavedFilling>(key, envelope); const updated = { ...old, name: message.name?.trim() || old.name, fields: old.fields.map((field) => { const candidate = message.fieldValues?.[field.descriptor.key]; return { ...field, value: candidate && valueMatchesKind(field.descriptor.kind, candidate) ? candidate : field.value, included: message.excludedKeys ? !message.excludedKeys.includes(field.descriptor.key) : field.included }; }), updatedAt: Date.now() }; await setEntryEnvelope(updated.id, await encryptRecord(key, updated)); return { ok: true, requestId: message.requestId, filling: updated };
+  if (message.type === 'UPDATE_FILLING') { const envelope = await getEntryEnvelope(message.id); if (!envelope) throw new Error('Saved filling not found.'); const old = await decryptRecord<SavedFilling>(key, envelope); const updatedFields = old.fields.map((field) => { const candidate = message.fieldValues?.[field.descriptor.key]; return fieldWithWait({ ...field, value: candidate && valueMatchesKind(field.descriptor.kind, candidate) ? candidate : field.value, included: message.excludedKeys ? !message.excludedKeys.includes(field.descriptor.key) : field.included }, message.fieldWaitAfterFillMs); }); const fieldsByKey = new Map(updatedFields.map((field) => [field.descriptor.key, field])); const reorderedFields = message.fieldOrder ? [...message.fieldOrder].map((key) => fieldsByKey.get(key)).filter((field): field is SavedFilling['fields'][number] => !!field) : []; const orderedKeys = new Set(message.fieldOrder ?? []); const updated = { ...old, name: message.name?.trim() || old.name, fields: message.fieldOrder ? [...reorderedFields, ...updatedFields.filter((field) => !orderedKeys.has(field.descriptor.key))] : updatedFields, waitAfterFillMs: message.waitAfterFillMs === undefined ? old.waitAfterFillMs : normalizeWaitAfterFillMs(message.waitAfterFillMs), updatedAt: Date.now() }; await setEntryEnvelope(updated.id, await encryptRecord(key, updated)); return { ok: true, requestId: message.requestId, filling: updated };
   }
   if (message.type === 'DELETE_FILLING') { const ids = await getEntryIds(); await deleteEntryEnvelope(message.id); await setEntryIds(ids.filter((id) => id !== message.id)); return { ok: true, requestId: message.requestId }; }
   if (message.type === 'DELETE_SITE_FILLINGS') { const entries = await allEntries(key); const remove = entries.filter((entry) => entry.form.origin === message.origin).map((entry) => entry.id); const ids = await getEntryIds(); for (const id of remove) await deleteEntryEnvelope(id); await setEntryIds(ids.filter((id) => !remove.includes(id))); return { ok: true, requestId: message.requestId }; }
@@ -195,4 +216,3 @@ function installListeners(): void {
   chrome.alarms.create('form-filler-maintenance', { periodInMinutes: 5 }); chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === 'form-filler-maintenance') void (async () => { if (dataKey && !(await unlocked())) return; if (dataKey) await pendingDrafts(dataKey); })(); });
 }
 installListeners();
-void (async () => { const stored = await getSession<string>(SESSION_KEY); if (stored) { /* Session keys survive worker suspension; the inactivity check still governs use. */ dataKey = fromSessionKey(stored); } await reconcile(); await finishPendingEnable(); })();

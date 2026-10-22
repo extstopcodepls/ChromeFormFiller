@@ -49,6 +49,8 @@ export interface CapturedField {
   value: FieldValue;
   included: boolean;
   unavailableReason?: string;
+  /** Optional per-field pause; when absent, the saved filling default is used. */
+  waitAfterFillMs?: number;
 }
 
 export interface FormIdentity {
@@ -81,6 +83,8 @@ export interface SavedFilling {
   createdAt: number;
   updatedAt: number;
   lastUsedAt?: number;
+  /** Default pause after each included field has been verified. */
+  waitAfterFillMs?: number;
 }
 
 export interface PendingDraft extends FormSnapshot {
@@ -94,6 +98,8 @@ export interface PendingDraft extends FormSnapshot {
 
 export interface FillFieldResult {
   key: string;
+  /** Human-readable field label/name for fill-result displays. */
+  fieldName: string;
   status: 'filled' | 'unchanged' | 'manual' | 'missing' | 'failed' | 'canceled';
   message?: string;
 }

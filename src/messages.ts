@@ -12,8 +12,9 @@ export type Message =
   | { type: 'LIST_MATCHES'; requestId: string; form: FormIdentity; fields?: CapturedField[] }
   | { type: 'CAPTURE_FORM'; requestId: string; form: FormSnapshot; saveDraft?: boolean }
   | { type: 'SUBMISSION_OBSERVED'; requestId: string; form: FormSnapshot }
-  | { type: 'SAVE_FILLING'; requestId: string; draftId?: string; filling?: SavedFilling; name?: string; excludedKeys?: string[] }
-  | { type: 'UPDATE_FILLING'; requestId: string; id: string; name?: string; excludedKeys?: string[]; fieldValues?: Record<string, FieldValue> }
+  | { type: 'GET_PENDING_SUBMISSION'; requestId: string; origin?: string }
+  | { type: 'SAVE_FILLING'; requestId: string; draftId?: string; filling?: SavedFilling; name?: string; excludedKeys?: string[]; waitAfterFillMs?: number; fieldWaitAfterFillMs?: Record<string, number | null> }
+  | { type: 'UPDATE_FILLING'; requestId: string; id: string; name?: string; excludedKeys?: string[]; fieldValues?: Record<string, FieldValue>; fieldOrder?: string[]; waitAfterFillMs?: number; fieldWaitAfterFillMs?: Record<string, number | null> }
   | { type: 'DELETE_FILLING'; requestId: string; id: string }
   | { type: 'DELETE_SITE_FILLINGS'; requestId: string; origin: string }
   | { type: 'CLEAR_VAULT'; requestId: string }
@@ -35,6 +36,7 @@ export type Response = {
   draft?: PendingDraft;
   drafts?: PendingDraft[];
   draftId?: string;
+  pendingForm?: FormIdentity;
   fill?: FillResult;
   message?: string;
 } | { ok: false; requestId?: string; error: string };
