@@ -23,6 +23,8 @@ Open the extension popup and enable **Enable debug logging**. The target page's 
 
 ### File path capture and replay
 
+With the vault unlocked, submissions containing eligible selected files are paused until the background worker finishes capture and saves the draft. The extension then calls `requestSubmit` with the original submit button so validation, button values/overrides, and page submit handlers run. Repeated submits during capture are coalesced. Capture errors or a 10-second timeout release the submission; a timeout may leave file paths unavailable. This requires a cancelable `submit` event: direct `form.submit()` calls and script-driven uploads that bypass that event cannot be delayed. Use **Save current** before those uploads.
+
 Chrome gates both `DOM.getFileInfo` (capture) and `DOM.setFileInputFiles` (replay) on the extension's **Allow access to file URLs** setting, even on HTTP/HTTPS pages. Chromium's [DOM handler](https://github.com/chromium/chromium/blob/main/content/browser/devtools/protocol/dom_handler.cc) returns `Not allowed` when file access is disabled; the [extension debugger implementation](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/chrome/browser/extensions/api/debugger/debugger_api.cc) uses that setting for local-file access. The commands still exist in [CDP](https://chromedevtools.github.io/devtools-protocol/tot/DOM/); `DOM.getFileInfo` remains experimental. This identifies a current permission requirement, not evidence of a particular recent Chrome regression.
 
 For a filling that reports no reusable local path:

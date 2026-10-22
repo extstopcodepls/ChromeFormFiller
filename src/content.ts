@@ -1,4 +1,5 @@
 import type { CapturedField, ControlKind, FieldDescriptor, FieldMatchKey, FieldValue, FillResult, FormIdentity, FormSnapshot, MatchSummary } from './types';
+import { createSubmissionGate } from './submission';
 
 declare global { interface Window { __formFillerLoaded?: boolean; } }
 
@@ -19,6 +20,7 @@ let debugEnabled = false;
 let revision = 0;
 let pendingPromptShown = false;
 const controllers = new Map<HTMLFormElement, FormController>();
+const delaySubmission = createSubmissionGate();
 
 interface FormController { form: HTMLFormElement; host: HTMLDivElement; button: HTMLButtonElement; menu: HTMLDivElement; status: HTMLDivElement; matches: MatchSummary[]; dragged: boolean; draftId?: string; }
 
@@ -204,7 +206,20 @@ function buildController(form: HTMLFormElement): FormController {
   position(controller); renderMenu(controller); return controller;
 }
 function discover(): void { for (const form of Array.from(document.forms)) if (!controllers.has(form)) controllers.set(form, buildController(form)); for (const [form, controller] of controllers) if (!document.contains(form)) { controller.host.remove(); controllers.delete(form); } for (const controller of controllers.values()) position(controller); }
-function handleSubmit(event: Event): void { const form = event.target instanceof HTMLFormElement ? event.target : undefined; if (!form) return; const controller = controllers.get(form); if (!vaultUnlocked) { debugLog('submission.ignored', { reason: 'vault-locked' }); if (controller) setStatus(controller, 'Unlock the vault before submitting to enable save offers.'); return; } const captured = snapshot(form); debugLog('submission.detected', { formIndex: captured.form.formIndex, fieldCount: captured.fields.length }); void request<any>({ type: 'SUBMISSION_OBSERVED', requestId: newRequestId(), form: captured }); }
+function handleSubmit(event: Event): void {
+  const form = event.target instanceof HTMLFormElement ? event.target : undefined;
+  if (!form) return;
+  const controller = controllers.get(form);
+  if (!vaultUnlocked) { debugLog('submission.ignored', { reason: 'vault-locked' }); if (controller) setStatus(controller, 'Unlock the vault before submitting to enable save offers.'); return; }
+  const captured = snapshot(form);
+  const observe = () => {
+    debugLog('submission.detected', { formIndex: captured.form.formIndex, fieldCount: captured.fields.length });
+    return request<any>({ type: 'SUBMISSION_OBSERVED', requestId: newRequestId(), form: captured });
+  };
+  const hasFiles = captured.fields.some((field) => field.value.tag === 'file' && field.value.files.length > 0);
+  if (delaySubmission(event, form, observe, (outcome) => debugLog('submission.resumed', { outcome }), hasFiles)) return;
+  void observe();
+}
 async function boot(): Promise<void> {
   document.addEventListener('submit', handleSubmit, true);
   const initial = await request<any>({ type: 'GET_SITE_STATUS', requestId: newRequestId() }); if (!initial.ok || !initial.status?.enabled) return; vaultUnlocked = !!initial.status.unlocked; debugEnabled = !!initial.status.debug; debugLog('boot', { origin: location.origin, formCount: document.forms.length, vaultUnlocked }); discover(); void showPendingSubmissionPrompt();
