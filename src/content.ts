@@ -8,10 +8,8 @@ declare global { interface Window { __formFillerLoaded?: boolean; } }
 // evaluation cannot collide with top-level lexical declarations in the page's
 // extension world.
 (() => {
-if (!window.__formFillerLoaded) {
-  window.__formFillerLoaded = true;
-  void boot();
-}
+if (window.__formFillerLoaded) return;
+window.__formFillerLoaded = true;
 
 const sensitiveWords = /password|passwd|passcode|secret|token|otp|one.?time|verification|auth.?code|cvv|cvc|security.?code|card.?number|cc.?number|iban|ssn|social.?security/i;
 const excludedTypes = new Set(['hidden', 'submit', 'reset', 'button', 'image', 'password']);
@@ -164,7 +162,17 @@ function formatDate(timestamp?: number): string { return timestamp ? new Date(ti
 function currentSummary(field: CapturedField): string { const value = field.value; if (value.tag === 'file') return value.files.map((file) => file.name).join(', ') || '(empty file selection)'; if (value.tag === 'options') return value.values.join(', ') || '(empty selection)'; if (value.tag === 'boolean') return String(value.value); if (value.tag === 'radio') return value.value ?? '(none selected)'; return value.value || '(empty)'; }
 function renderMenu(controller: FormController): void {
   controller.menu.replaceChildren();
-  if (!vaultUnlocked) { const locked = document.createElement('div'); locked.className = 'notice'; locked.textContent = 'Unlock to save or fill.'; controller.menu.append(locked); return; }
+  if (!vaultUnlocked) {
+    const locked = document.createElement('div'); locked.className = 'notice'; locked.textContent = 'Unlock to save or fill.';
+    const unlock = document.createElement('button'); unlock.className = 'menu-item action'; unlock.type = 'button'; unlock.textContent = 'Unlock vault';
+    unlock.addEventListener('click', () => {
+      unlock.disabled = true;
+      void request<any>({ type: 'OPEN_LIBRARY', requestId: newRequestId() }).then((response) => {
+        setStatus(controller, response.ok ? 'Complete vault unlock in the extension tab.' : response.error);
+      }).finally(() => { unlock.disabled = false; });
+    });
+    controller.menu.append(locked, unlock); return;
+  }
   if (controller.matches.length) { const heading = document.createElement('div'); heading.className = 'menu-heading'; heading.textContent = 'Saved fillings'; controller.menu.append(heading); }
   for (const match of controller.matches) { const item = document.createElement('button'); item.className = 'menu-item'; item.type = 'button'; item.innerHTML = `<span>${escapeHtml(match.name)}</span><small>${formatDate(match.lastUsedAt)} · ${match.fieldCount} fields</small>`; item.addEventListener('click', () => previewFill(controller, match)); controller.menu.append(item); }
   const save = document.createElement('button'); save.className = 'menu-item action'; save.type = 'button'; save.textContent = 'Save current filling'; save.addEventListener('click', () => void saveCurrent(controller)); controller.menu.append(save);
@@ -193,7 +201,7 @@ async function showPendingSubmissionPrompt(attempt = 0): Promise<void> {
   else if (attempt < 10) window.setTimeout(() => { void showPendingSubmissionPrompt(attempt + 1); }, 200);
 }
 function escapeHtml(text: string): string { return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'); }
-async function refreshMatches(controller: FormController): Promise<void> { if (!vaultUnlocked) { controller.matches = []; renderMenu(controller); return; } const current = snapshot(controller.form); debugLog('matches.requested', { form: { index: current.form.formIndex, id: current.form.formId || '(none)', name: current.form.formName || '(none)', pathname: current.form.pathname, fingerprint: current.form.fingerprint }, controls: controlsFor(controller.form).map(controlTrace), serializedFields: current.fields.map(fieldTrace) }); const response = await request<any>({ type: 'LIST_MATCHES', requestId: newRequestId(), form: current.form, fields: current.fields }); if (response.ok) { controller.matches = response.matches ?? []; debugLog('matches.listed', { formIndex: current.form.formIndex, fingerprint: current.form.fingerprint, count: controller.matches.length, matches: controller.matches.map((match) => ({ id: match.id, name: match.name, fieldCount: match.fieldCount })) }); renderMenu(controller); } else debugLog('matches.error', { formIndex: current.form.formIndex, message: response.error }); }
+async function refreshMatches(controller: FormController): Promise<void> { if (!vaultUnlocked) { controller.matches = []; renderMenu(controller); return; } const current = snapshot(controller.form); debugLog('matches.requested', { form: { index: current.form.formIndex, id: current.form.formId || '(none)', name: current.form.formName || '(none)', pathname: current.form.pathname, fingerprint: current.form.fingerprint }, controls: controlsFor(controller.form).map(controlTrace), serializedFields: current.fields.map(fieldTrace) }); const response = await request<any>({ type: 'LIST_MATCHES', requestId: newRequestId(), form: current.form, fields: current.fields }); if (!vaultUnlocked) return; if (response.ok) { controller.matches = response.matches ?? []; debugLog('matches.listed', { formIndex: current.form.formIndex, fingerprint: current.form.fingerprint, count: controller.matches.length, matches: controller.matches.map((match) => ({ id: match.id, name: match.name, fieldCount: match.fieldCount })) }); renderMenu(controller); } else debugLog('matches.error', { formIndex: current.form.formIndex, message: response.error }); }
 async function fill(controller: FormController, id: string): Promise<void> { close(controller); setStatus(controller, 'Filling…'); const current = snapshot(controller.form); const form = current.form; const selected = controller.matches.find((match) => match.id === id); const fieldsByKey = new Map(current.fields.map((field) => [field.descriptor.key, field])); const savedFieldsByKey = new Map(selected?.preview.map((field) => [field.key, field]) ?? []); const savedFieldTrace = (field: MatchSummary['preview'][number]) => ({ resultKey: field.key, kind: field.kind, matchKeys: field.matchKeys, id: field.id || '(none)', name: field.name || '(none)', label: field.label || '(none)', position: field.index }); debugLog('fill.requested', { entry: { id, name: selected?.name ?? '(unknown)', savedFieldCount: selected?.fieldCount }, targetForm: formTrace(form), intendedSavedFields: selected?.preview.map(savedFieldTrace) ?? [], currentFields: current.fields.map(fieldTrace) }); const response = await request<any>({ type: 'START_FILL', requestId: newRequestId(), id, form, fields: current.fields }); if (!response.ok) { debugLog('fill.error', { entryId: id, targetForm: formTrace(form), message: response.error }); setStatus(controller, response.error); return; } const fillResult = response.fill; debugLog('fill.completed', { entry: { id, name: selected?.name ?? '(unknown)' }, targetForm: formTrace(form), status: fillResult.status, fieldCount: fillResult.fields.length, fields: fillResult.fields.map((field: any, resultIndex: number) => { const expected = savedFieldsByKey.get(field.key); const currentExactKey = fieldsByKey.get(field.key); return { resultIndex, resultKey: field.key, status: field.status, message: field.message, expectedSavedField: expected ? savedFieldTrace(expected) : '(not found in selected preview)', currentExactKeyField: currentExactKey ? fieldTrace(currentExactKey) : '(none; see worker field.match for independent lookup attempts)' }; }), failedCount: fillResult.fields.filter((field: any) => !['filled', 'unchanged'].includes(field.status)).length }); showFillResult(controller, fillResult); await refreshMatches(controller); }
 async function saveCurrent(controller: FormController): Promise<void> { close(controller); const captured = snapshot(controller.form); debugLog('capture.requested', { formIndex: captured.form.formIndex, fieldCount: captured.fields.length, serializedFields: captured.fields.map(fieldTrace) }); const response = await request<any>({ type: 'CAPTURE_FORM', requestId: newRequestId(), form: captured, saveDraft: true }); if (!response.ok) { debugLog('capture.error', { formIndex: captured.form.formIndex, message: response.error }); setStatus(controller, response.error); return; } debugLog('capture.completed', { formIndex: captured.form.formIndex, draftCreated: !!response.draftId }); await request<any>({ type: 'OPEN_LIBRARY', requestId: newRequestId(), draftId: response.draftId }); }
 async function openLibrary(): Promise<void> { await request<any>({ type: 'OPEN_LIBRARY', requestId: newRequestId() }); }
@@ -222,11 +230,12 @@ function handleSubmit(event: Event): void {
 }
 async function boot(): Promise<void> {
   let receivedVaultState = false;
-  chrome.runtime.onMessage.addListener((message) => { if (message?.type === 'DEBUG_STATE') { debugEnabled = !!message.enabled; debugLog('debug.enabled', { enabled: debugEnabled }); return; } if (message?.type === 'VAULT_STATE') { receivedVaultState = true; vaultUnlocked = !!message.unlocked; debugLog('vault.state', { unlocked: vaultUnlocked }); for (const controller of controllers.values()) { renderMenu(controller); if (!vaultUnlocked) setStatus(controller, 'Vault locked.'); } } });
+  chrome.runtime.onMessage.addListener((message) => { if (message?.type === 'DEBUG_STATE') { debugEnabled = !!message.enabled; debugLog('debug.enabled', { enabled: debugEnabled }); return; } if (message?.type === 'VAULT_STATE') { receivedVaultState = true; vaultUnlocked = !!message.unlocked; debugLog('vault.state', { unlocked: vaultUnlocked }); for (const controller of controllers.values()) { controller.matches = []; renderMenu(controller); setStatus(controller, vaultUnlocked ? 'Vault unlocked.' : 'Vault locked.'); if (vaultUnlocked) void refreshMatches(controller); } } });
   document.addEventListener('submit', handleSubmit, true);
   const initial = await request<any>({ type: 'GET_SITE_STATUS', requestId: newRequestId() }); if (!initial.ok || !initial.status?.enabled) return; if (!receivedVaultState) vaultUnlocked = !!initial.status.unlocked; debugEnabled = !!initial.status.debug; debugLog('boot', { origin: location.origin, formCount: document.forms.length, vaultUnlocked }); discover(); void showPendingSubmissionPrompt();
   const observer = new MutationObserver(() => { window.clearTimeout((observer as any)._timer); (observer as any)._timer = window.setTimeout(discover, 150); }); observer.observe(document.documentElement, { childList: true, subtree: true });
   addEventListener('scroll', () => { for (const controller of controllers.values()) position(controller); }, { passive: true }); addEventListener('resize', () => { for (const controller of controllers.values()) position(controller); });
   document.addEventListener('input', () => { revision += 1; }, true); document.addEventListener('change', () => { revision += 1; }, true);
 }
+void boot();
 })();

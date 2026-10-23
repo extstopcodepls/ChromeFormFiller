@@ -6,12 +6,15 @@ class Element {
   textContent = '';
   id = '';
   hidden = false;
-  listeners = new Map<string, () => void>();
+  type = '';
+  value = '';
+  disabled = false;
+  listeners = new Map<string, (...args: any[]) => void>();
   constructor(readonly tag: string) {}
   append(...children: Element[]) { this.children.push(...children); }
   replaceChildren(...children: Element[]) { this.children = children; }
   setAttribute() {}
-  addEventListener(event: string, listener: () => void) { this.listeners.set(event, listener); }
+  addEventListener(event: string, listener: (...args: any[]) => void) { this.listeners.set(event, listener); }
   all(): Element[] { return [this, ...this.children.flatMap((child) => child.all())]; }
 }
 
@@ -90,5 +93,40 @@ describe('popup startup recovery', () => {
     oldCallback({ ok: false, error: 'Old request failed' }); await flush();
     expect(texts()).toContain(status.origin);
     expect(texts()).not.toContain('Old request failed');
+  });
+
+  it('shows unlock progress and coalesces repeated submissions', async () => {
+    send.mockImplementation((message, callback) => { if (message.type !== 'UNLOCK_VAULT') callback({ ok: true, status }); });
+    await import('../src/popup'); await flush();
+    const form = app.all().find((node) => node.tag === 'form')!;
+    const input = form.all().find((node) => node.type === 'password')!;
+    input.value = 'correct passphrase';
+    const submit = () => form.listeners.get('submit')!({ preventDefault() {} });
+    submit(); submit(); await flush();
+    expect(texts()).toContain('Unlocking…');
+    expect(input.disabled).toBe(true);
+    expect(send.mock.calls.filter(([message]) => message.type === 'UNLOCK_VAULT')).toHaveLength(1);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'UNLOCK_VAULT', passphrase: 'correct passphrase' }), expect.any(Function));
+  });
+
+  it('recovers from an unlock timeout and ignores the expired attempt after retry', async () => {
+    const callbacks: Array<(response: unknown) => void> = [];
+    send.mockImplementation((message, callback) => {
+      if (message.type === 'UNLOCK_VAULT') callbacks.push(callback);
+      else callback({ ok: true, status: { ...status, unlocked: callbacks.length > 1 } });
+    });
+    await import('../src/popup'); await flush();
+    const form = app.all().find((node) => node.tag === 'form')!;
+    const input = form.all().find((node) => node.type === 'password')!;
+    input.value = 'first passphrase'; form.listeners.get('submit')!({ preventDefault() {} });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(texts()).toContain('Unlock timed out. Try again to reconnect.');
+    expect(input.disabled).toBe(false); expect(input.value).toBe('');
+    input.value = 'correct passphrase'; form.listeners.get('submit')!({ preventDefault() {} });
+    callbacks[1]({ ok: true }); await flush();
+    expect(texts()).toContain('Lock vault');
+    callbacks[0]({ ok: false, error: 'Expired unlock failure' }); await flush();
+    expect(texts()).toContain('Lock vault');
+    expect(texts()).not.toContain('Expired unlock failure');
   });
 });

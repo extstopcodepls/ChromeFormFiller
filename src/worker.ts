@@ -47,6 +47,20 @@ function withVaultState<T>(operation: () => Promise<T>): Promise<T> {
   vaultStateQueue = current.catch(() => undefined);
   return current;
 }
+async function prepareUnlock(passphrase: string, timeoutMs: number): Promise<{ raw: Uint8Array; meta?: VaultMeta }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      (async () => {
+        const existing = await getVaultMeta();
+        if (existing) return { raw: await unlockVault(passphrase, existing) };
+        const created = await createVault(passphrase);
+        return { raw: created.dataKey, meta: created.meta };
+      })(),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Unlock timed out. Try again.')), timeoutMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
 async function unlockedNow(): Promise<boolean> {
   const last = await getSession<number>(ACTIVITY_KEY);
   if (dataKey && last && Date.now() - last < LOCK_AFTER) return true;
@@ -89,7 +103,9 @@ async function getSiteStatus(tabId?: number, url?: string): Promise<SiteStatus> 
   return { origin, enabled: origin ? config.enabledOrigins.includes(origin) : false, permission, unlocked: isUnlocked, pendingCount: isUnlocked && dataKey ? (await pendingDrafts(dataKey)).length : 0, debug: config.debug };
 }
 async function debugLog(event: string, details: Record<string, unknown> = {}): Promise<void> { if ((await getConfig()).debug) console.info('[Form Filler][worker]', event, details); }
-async function broadcast(message: unknown): Promise<void> { const tabs = await chrome.tabs.query({}); await Promise.all(tabs.flatMap((tab) => tab.id === undefined ? [] : [chrome.tabs.sendMessage(tab.id, message).catch(() => undefined)])); }
+// Page listeners can leave their response channels open indefinitely. Dispatch
+// notifications in order, but never hold the vault state queue on their replies.
+async function broadcast(message: unknown): Promise<void> { const tabs = await chrome.tabs.query({}); for (const tab of tabs) if (tab.id !== undefined) void chrome.tabs.sendMessage(tab.id, message).catch(() => undefined); }
 
 async function registerOrigin(origin: string): Promise<void> {
   const pending = originRegistrations.get(origin);
@@ -102,7 +118,14 @@ async function registerOriginOnce(origin: string): Promise<void> {
   const id = `form-filler-${btoa(origin).replaceAll('=', '').replaceAll('/', '_').replaceAll('+', '-')}`;
   const scripts = await chrome.scripting.getRegisteredContentScripts({ ids: [id] });
   if (scripts.length) return;
-  await chrome.scripting.registerContentScripts([{ id, matches: [permissionPattern(origin)], js: ['content.js'], runAt: 'document_start', allFrames: false, persistAcrossSessions: true }]);
+  try {
+    await chrome.scripting.registerContentScripts([{ id, matches: [permissionPattern(origin)], js: ['content.js'], runAt: 'document_start', allFrames: false, persistAcrossSessions: true }]);
+  } catch (error) {
+    // Another registration (for example an onInstalled reconciliation) may
+    // have won the race. Only ignore a failure when the script now exists.
+    if ((await chrome.scripting.getRegisteredContentScripts({ ids: [id] })).length) return;
+    throw error;
+  }
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) if (tab.id !== undefined && originFromUrl(tab.url) === origin) await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }).catch(() => undefined);
 }
@@ -169,9 +192,10 @@ async function captureSnapshot(tabId: number | undefined, snapshot: FormSnapshot
 const workerReady = (async () => {
   const stored = await getSession<string>(SESSION_KEY);
   if (stored) dataKey = fromSessionKey(stored);
-  await reconcile();
-  await finishPendingEnable();
 })();
+// Script registration must not block status/unlock messages, including when a
+// persisted script is duplicated or Chrome is slow to inject an existing tab.
+void workerReady.then(async () => { await reconcile(); await finishPendingEnable(); }).catch((error) => console.warn('[Form Filler][worker]', 'Site initialization failed.', error));
 
 async function handle(message: Message, sender: chrome.runtime.MessageSender): Promise<Response> {
   await workerReady;
@@ -189,9 +213,15 @@ async function handle(message: Message, sender: chrome.runtime.MessageSender): P
     if (!senderOrigin) throw new Error('No enabled site is active.'); const config = await getConfig(); config.enabledOrigins = config.enabledOrigins.filter((item) => item !== senderOrigin); await setConfig(config); if (dataKey && await unlocked()) await deleteDraftsForOrigin(dataKey, senderOrigin); await unregisterOrigin(senderOrigin); return { ok: true, status: await getSiteStatus(tabId, tabUrl) };
   }
   if (message.type === 'UNLOCK_VAULT') {
+    const deadline = Date.now() + 8000;
     return withVaultState(async () => {
       if (!message.passphrase || message.passphrase.length < 8) throw new Error('Use a passphrase of at least 8 characters.');
-      const existing = await getVaultMeta(); let raw: Uint8Array; if (!existing) { const created = await createVault(message.passphrase); await setVaultMeta(created.meta); raw = created.dataKey; } else raw = await unlockVault(message.passphrase, existing);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error('Unlock timed out. Try again.');
+      // Derivation has no storage side effects: a result arriving after the
+      // deadline cannot create a vault or unlock it behind the retry's back.
+      const { raw, meta } = await prepareUnlock(message.passphrase, remaining);
+      if (meta) await setVaultMeta(meta);
       await setSession({ [SESSION_KEY]: toSessionKey(raw), [ACTIVITY_KEY]: Date.now() }); dataKey = raw; await broadcast({ type: 'VAULT_STATE', unlocked: true }); return { ok: true, message: 'Vault unlocked.' };
     });
   }

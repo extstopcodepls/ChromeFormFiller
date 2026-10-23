@@ -53,10 +53,17 @@ export function isMessage(value: unknown): value is Message {
 
 export function sendMessage<T extends Response>(message: Message): Promise<T> {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(message, (response: T) => {
-      if (chrome.runtime.lastError) resolve({ ok: false, requestId: message.requestId, error: chrome.runtime.lastError.message ?? 'Extension unavailable' } as T);
-      else resolve(response ?? ({ ok: false, requestId: message.requestId, error: 'Empty response' } as T));
-    });
+    const timeout = message.type === 'UNLOCK_VAULT' ? setTimeout(() => resolve({ ok: false, requestId: message.requestId, error: 'Unlock timed out. Try again to reconnect.' } as T), 10_000) : undefined;
+    try {
+      chrome.runtime.sendMessage(message, (response: T) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) resolve({ ok: false, requestId: message.requestId, error: chrome.runtime.lastError.message ?? 'Extension unavailable' } as T);
+        else resolve(response ?? ({ ok: false, requestId: message.requestId, error: 'Empty response' } as T));
+      });
+    } catch (error) {
+      clearTimeout(timeout);
+      resolve({ ok: false, requestId: message.requestId, error: error instanceof Error ? error.message : 'Extension unavailable' } as T);
+    }
   });
 }
 

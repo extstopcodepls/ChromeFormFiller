@@ -1,6 +1,21 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
+
+// Chrome injects this entry as a classic script. Scope the complete output,
+// including bundled helpers, so repeated injection cannot redeclare globals.
+export function contentScriptScope(): Plugin {
+  return {
+    name: 'content-script-scope',
+    generateBundle(_options, bundle) {
+      const content = bundle['content.js'];
+      if (!content || content.type !== 'chunk') return;
+      if (content.imports.length || content.dynamicImports.length) throw new Error('The content script must be a standalone bundle.');
+      content.code = `(() => {\n${content.code}\n})();`;
+    },
+  };
+}
 
 export default defineConfig(({ mode }) => ({
+  plugins: [contentScriptScope()],
   build: {
     outDir: 'dist',
     emptyOutDir: true,
