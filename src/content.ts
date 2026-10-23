@@ -17,10 +17,11 @@ let vaultUnlocked = false;
 let debugEnabled = false;
 let revision = 0;
 let pendingPromptShown = false;
+const shownSubmissionDrafts = new Set<string>();
 const controllers = new Map<HTMLFormElement, FormController>();
 const delaySubmission = createSubmissionGate();
 
-interface FormController { form: HTMLFormElement; host: HTMLDivElement; button: HTMLButtonElement; menu: HTMLDivElement; status: HTMLDivElement; matches: MatchSummary[]; dragged: boolean; draftId?: string; }
+interface FormController { form: HTMLFormElement; host: HTMLDivElement; button: HTMLButtonElement; menu: HTMLDivElement; status: HTMLDivElement; matches: MatchSummary[]; dragged: boolean; draftId?: string; filledState?: string; filling?: boolean; fillFinished?: Promise<void>; editedDuringFill?: boolean; }
 
 function newRequestId(): string { return crypto.randomUUID(); }
 function sendMessage<T>(message: unknown): Promise<T> { return new Promise((resolve) => { chrome.runtime.sendMessage(message, (response: T) => { if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message ?? 'Extension unavailable' } as T); else resolve(response); }); }); }
@@ -110,6 +111,32 @@ function snapshot(form: HTMLFormElement): FormSnapshot {
   all.forEach((control, index) => { if (!eligible(control)) return; const kind = kindFor(control)!; fields.push({ descriptor: descriptor(control, kind, index, form), value: readValue(control, kind), included: true, ...(kind === 'file' ? { unavailableReason: 'A reusable local path was not exposed by Chrome during capture.' } : {}) }); });
   return { form: formId, fields, capturedAt: Date.now(), revision, completeness: 'complete' };
 }
+function fillingState(captured: FormSnapshot): string {
+  // Compare current values, including file metadata, rather than revision/event
+  // counts: replay itself emits input/change events. Generated IDs and capture
+  // timestamps do not turn an unchanged replay into a new filling.
+  return JSON.stringify([captured.form.fingerprint, captured.fields.map(({ descriptor, value }) => [descriptor.key, descriptor.kind, value])]);
+}
+function isUnchangedFill(controller: FormController, captured = snapshot(controller.form)): boolean {
+  return controller.filledState !== undefined && controller.filledState === fillingState(captured);
+}
+function handleEdit(event: Event): void {
+  revision += 1;
+  const control = event.target;
+  if (!(control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement) || !control.form || !eligible(control)) return;
+  const controller = controllers.get(control.form);
+  if (!controller) return;
+  if (controller.filling) {
+    // Text/select replay events are synthetic. CDP file selection can emit
+    // trusted events, so file values are compared after replay instead.
+    if (event.isTrusted && kindFor(control) !== 'file') controller.editedDuringFill = true;
+    return;
+  }
+  if (controller.filledState !== undefined && !isUnchangedFill(controller)) {
+    controller.filledState = undefined;
+    renderMenu(controller);
+  }
+}
 function position(controller: FormController): void {
   controller.host.style.display = 'block';
   if (controller.dragged) return;
@@ -175,23 +202,24 @@ function renderMenu(controller: FormController): void {
   }
   if (controller.matches.length) { const heading = document.createElement('div'); heading.className = 'menu-heading'; heading.textContent = 'Saved fillings'; controller.menu.append(heading); }
   for (const match of controller.matches) { const item = document.createElement('button'); item.className = 'menu-item'; item.type = 'button'; item.innerHTML = `<span>${escapeHtml(match.name)}</span><small>${formatDate(match.lastUsedAt)} · ${match.fieldCount} fields</small>`; item.addEventListener('click', () => previewFill(controller, match)); controller.menu.append(item); }
-  const save = document.createElement('button'); save.className = 'menu-item action'; save.type = 'button'; save.textContent = 'Save current filling'; save.addEventListener('click', () => void saveCurrent(controller)); controller.menu.append(save);
+  if (!controller.filling && !isUnchangedFill(controller)) { const save = document.createElement('button'); save.className = 'menu-item action'; save.type = 'button'; save.textContent = 'Save current filling'; save.addEventListener('click', () => void saveCurrent(controller)); controller.menu.append(save); }
   const manage = document.createElement('button'); manage.className = 'menu-item action'; manage.type = 'button'; manage.textContent = 'Manage fillings for this form'; manage.addEventListener('click', () => void openLibrary()); controller.menu.append(manage);
 }
 function previewFill(controller: FormController, match: MatchSummary): void { controller.menu.replaceChildren(); const heading = document.createElement('div'); heading.className = 'menu-heading'; heading.textContent = `Preview: ${match.name}`; controller.menu.append(heading); const current = new Map(snapshot(controller.form).fields.map((field) => [field.descriptor.key, currentSummary(field)])); for (const field of match.preview) { const row = document.createElement('div'); row.className = 'notice'; const changed = current.get(field.key); row.textContent = `${field.label}: ${field.value}${changed && changed !== field.value ? ` (replaces ${changed})` : ''}`; controller.menu.append(row); } const fillButton = document.createElement('button'); fillButton.className = 'menu-item action'; fillButton.type = 'button'; fillButton.textContent = 'Fill these values'; fillButton.addEventListener('click', () => void fill(controller, match.id)); const cancel = document.createElement('button'); cancel.className = 'menu-item action'; cancel.type = 'button'; cancel.textContent = 'Cancel'; cancel.addEventListener('click', () => renderMenu(controller)); controller.menu.append(fillButton, cancel); }
-function closeSubmissionPrompt(host: HTMLDivElement): void { host.remove(); }
+function closeSubmissionPrompt(host: HTMLDivElement): void { host.remove(); pendingPromptShown = false; }
 function createSubmissionPrompt(draftId: string, form: FormIdentity): void {
-  if (pendingPromptShown) return;
+  if (pendingPromptShown || shownSubmissionDrafts.has(draftId)) return;
   pendingPromptShown = true;
+  shownSubmissionDrafts.add(draftId);
   const host = document.createElement('div'); host.className = 'form-filler-submission-prompt'; host.style.position = 'fixed'; host.style.top = '16px'; host.style.right = '16px'; host.style.zIndex = '2147483647'; host.style.pointerEvents = 'auto';
   const shadow = host.attachShadow({ mode: 'open' });
   const style = document.createElement('style'); style.textContent = `:host{all:initial;font-family:system-ui,sans-serif;color:#172033}.card{width:320px;padding:8px;border:1px solid #fbbf24;border-radius:10px;background:#fff;box-shadow:0 8px 30px #0003}.heading{padding:8px 9px;font-size:14px;font-weight:700}.notice{padding:4px 9px 10px;color:#475569;font-size:13px;line-height:1.4}.actions{display:grid;gap:4px}.action{display:block;width:100%;border:0;border-top:1px solid #eef2f7;border-radius:6px;padding:9px;background:#fff;color:#3730a3;text-align:left;cursor:pointer}.action:hover{background:#eef2ff}.action:focus-visible{outline:3px solid #60a5fa;outline-offset:2px}.secondary{color:#475569;font-size:12px}`;
   const card = document.createElement('div'); card.className = 'card'; const heading = document.createElement('div'); heading.className = 'heading'; heading.textContent = 'Save this filling?'; const notice = document.createElement('div'); notice.className = 'notice'; notice.textContent = 'A submission attempt was detected. Choose what to do with the captured values.'; const actions = document.createElement('div'); actions.className = 'actions';
-  const finish = (): void => closeSubmissionPrompt(host);
+  const finish = (): void => { window.clearTimeout(timer); closeSubmissionPrompt(host); };
   const review = document.createElement('button'); review.className = 'action'; review.type = 'button'; review.textContent = 'Review and save'; review.addEventListener('click', () => { finish(); void request<any>({ type: 'OPEN_LIBRARY', requestId: newRequestId(), draftId }); });
   const dismiss = document.createElement('button'); dismiss.className = 'action secondary'; dismiss.type = 'button'; dismiss.textContent = 'Dismiss'; dismiss.addEventListener('click', () => { finish(); void request<any>({ type: 'DISMISS_DRAFT', requestId: newRequestId(), id: draftId }); });
   const never = document.createElement('button'); never.className = 'action secondary'; never.type = 'button'; never.textContent = 'Never offer for this form'; never.addEventListener('click', () => { finish(); void request<any>({ type: 'IGNORE_FORM', requestId: newRequestId(), form }).then(() => request<any>({ type: 'DISMISS_DRAFT', requestId: newRequestId(), id: draftId })); });
-  window.setTimeout(finish, 10_000);
+  const timer = window.setTimeout(finish, 10_000);
   actions.append(review, dismiss, never); card.append(heading, notice, actions); shadow.append(style, card); document.documentElement.append(host);
 }
 async function showPendingSubmissionPrompt(attempt = 0): Promise<void> {
@@ -202,8 +230,47 @@ async function showPendingSubmissionPrompt(attempt = 0): Promise<void> {
 }
 function escapeHtml(text: string): string { return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'); }
 async function refreshMatches(controller: FormController): Promise<void> { if (!vaultUnlocked) { controller.matches = []; renderMenu(controller); return; } const current = snapshot(controller.form); debugLog('matches.requested', { form: { index: current.form.formIndex, id: current.form.formId || '(none)', name: current.form.formName || '(none)', pathname: current.form.pathname, fingerprint: current.form.fingerprint }, controls: controlsFor(controller.form).map(controlTrace), serializedFields: current.fields.map(fieldTrace) }); const response = await request<any>({ type: 'LIST_MATCHES', requestId: newRequestId(), form: current.form, fields: current.fields }); if (!vaultUnlocked) return; if (response.ok) { controller.matches = response.matches ?? []; debugLog('matches.listed', { formIndex: current.form.formIndex, fingerprint: current.form.fingerprint, count: controller.matches.length, matches: controller.matches.map((match) => ({ id: match.id, name: match.name, fieldCount: match.fieldCount })) }); renderMenu(controller); } else debugLog('matches.error', { formIndex: current.form.formIndex, message: response.error }); }
-async function fill(controller: FormController, id: string): Promise<void> { close(controller); setStatus(controller, 'Filling…'); const current = snapshot(controller.form); const form = current.form; const selected = controller.matches.find((match) => match.id === id); const fieldsByKey = new Map(current.fields.map((field) => [field.descriptor.key, field])); const savedFieldsByKey = new Map(selected?.preview.map((field) => [field.key, field]) ?? []); const savedFieldTrace = (field: MatchSummary['preview'][number]) => ({ resultKey: field.key, kind: field.kind, matchKeys: field.matchKeys, id: field.id || '(none)', name: field.name || '(none)', label: field.label || '(none)', position: field.index }); debugLog('fill.requested', { entry: { id, name: selected?.name ?? '(unknown)', savedFieldCount: selected?.fieldCount }, targetForm: formTrace(form), intendedSavedFields: selected?.preview.map(savedFieldTrace) ?? [], currentFields: current.fields.map(fieldTrace) }); const response = await request<any>({ type: 'START_FILL', requestId: newRequestId(), id, form, fields: current.fields }); if (!response.ok) { debugLog('fill.error', { entryId: id, targetForm: formTrace(form), message: response.error }); setStatus(controller, response.error); return; } const fillResult = response.fill; debugLog('fill.completed', { entry: { id, name: selected?.name ?? '(unknown)' }, targetForm: formTrace(form), status: fillResult.status, fieldCount: fillResult.fields.length, fields: fillResult.fields.map((field: any, resultIndex: number) => { const expected = savedFieldsByKey.get(field.key); const currentExactKey = fieldsByKey.get(field.key); return { resultIndex, resultKey: field.key, status: field.status, message: field.message, expectedSavedField: expected ? savedFieldTrace(expected) : '(not found in selected preview)', currentExactKeyField: currentExactKey ? fieldTrace(currentExactKey) : '(none; see worker field.match for independent lookup attempts)' }; }), failedCount: fillResult.fields.filter((field: any) => !['filled', 'unchanged'].includes(field.status)).length }); showFillResult(controller, fillResult); await refreshMatches(controller); }
-async function saveCurrent(controller: FormController): Promise<void> { close(controller); const captured = snapshot(controller.form); debugLog('capture.requested', { formIndex: captured.form.formIndex, fieldCount: captured.fields.length, serializedFields: captured.fields.map(fieldTrace) }); const response = await request<any>({ type: 'CAPTURE_FORM', requestId: newRequestId(), form: captured, saveDraft: true }); if (!response.ok) { debugLog('capture.error', { formIndex: captured.form.formIndex, message: response.error }); setStatus(controller, response.error); return; } debugLog('capture.completed', { formIndex: captured.form.formIndex, draftCreated: !!response.draftId }); await request<any>({ type: 'OPEN_LIBRARY', requestId: newRequestId(), draftId: response.draftId }); }
+async function fill(controller: FormController, id: string): Promise<void> {
+  if (controller.filling) return;
+  close(controller); setStatus(controller, 'Filling…');
+  const current = snapshot(controller.form); const form = current.form;
+  const selected = controller.matches.find((match) => match.id === id);
+  const fieldsByKey = new Map(current.fields.map((field) => [field.descriptor.key, field]));
+  const savedFieldsByKey = new Map(selected?.preview.map((field) => [field.key, field]) ?? []);
+  const savedFieldTrace = (field: MatchSummary['preview'][number]) => ({ resultKey: field.key, kind: field.kind, matchKeys: field.matchKeys, id: field.id || '(none)', name: field.name || '(none)', label: field.label || '(none)', position: field.index });
+  debugLog('fill.requested', { entry: { id, name: selected?.name ?? '(unknown)', savedFieldCount: selected?.fieldCount }, targetForm: formTrace(form), intendedSavedFields: selected?.preview.map(savedFieldTrace) ?? [], currentFields: current.fields.map(fieldTrace) });
+  controller.filling = true; controller.editedDuringFill = false; controller.filledState = undefined;
+  let finishFill!: () => void;
+  controller.fillFinished = new Promise((resolve) => { finishFill = resolve; });
+  renderMenu(controller);
+  try {
+    const response = await request<any>({ type: 'START_FILL', requestId: newRequestId(), id, form, fields: current.fields });
+    if (!response.ok) {
+      debugLog('fill.error', { entryId: id, targetForm: formTrace(form), message: response.error });
+      setStatus(controller, response.error); return;
+    }
+    const fillResult: FillResult = response.fill;
+    if (!controller.editedDuringFill && fillResult.fields.some((field) => ['filled', 'unchanged'].includes(field.status))) {
+      controller.filledState = fillingState(snapshot(controller.form));
+    }
+    debugLog('fill.completed', {
+      entry: { id, name: selected?.name ?? '(unknown)' }, targetForm: formTrace(form), status: fillResult.status, fieldCount: fillResult.fields.length,
+      fields: fillResult.fields.map((field, resultIndex) => {
+        const expected = savedFieldsByKey.get(field.key); const currentExactKey = fieldsByKey.get(field.key);
+        return { resultIndex, resultKey: field.key, status: field.status, message: field.message, expectedSavedField: expected ? savedFieldTrace(expected) : '(not found in selected preview)', currentExactKeyField: currentExactKey ? fieldTrace(currentExactKey) : '(none; see worker field.match for independent lookup attempts)' };
+      }),
+      failedCount: fillResult.fields.filter((field) => !['filled', 'unchanged'].includes(field.status)).length,
+    });
+    showFillResult(controller, fillResult);
+  } finally {
+    controller.filling = false;
+    controller.fillFinished = undefined;
+    finishFill();
+    renderMenu(controller);
+  }
+  await refreshMatches(controller);
+}
+async function saveCurrent(controller: FormController): Promise<void> { close(controller); const captured = snapshot(controller.form); if (controller.filling || isUnchangedFill(controller, captured)) return; debugLog('capture.requested', { formIndex: captured.form.formIndex, fieldCount: captured.fields.length, serializedFields: captured.fields.map(fieldTrace) }); const response = await request<any>({ type: 'CAPTURE_FORM', requestId: newRequestId(), form: captured, saveDraft: true }); if (!response.ok) { debugLog('capture.error', { formIndex: captured.form.formIndex, message: response.error }); setStatus(controller, response.error); return; } debugLog('capture.completed', { formIndex: captured.form.formIndex, draftCreated: !!response.draftId }); await request<any>({ type: 'OPEN_LIBRARY', requestId: newRequestId(), draftId: response.draftId }); }
 async function openLibrary(): Promise<void> { await request<any>({ type: 'OPEN_LIBRARY', requestId: newRequestId() }); }
 function buildController(form: HTMLFormElement): FormController {
   const host = document.createElement('div'); host.className = 'form-filler-host'; host.style.position = 'fixed'; host.style.zIndex = '2147483646'; host.style.pointerEvents = 'auto'; const shadow = host.attachShadow({ mode: 'open' });
@@ -219,13 +286,23 @@ function handleSubmit(event: Event): void {
   if (!form) return;
   const controller = controllers.get(form);
   if (!vaultUnlocked) { debugLog('submission.ignored', { reason: 'vault-locked' }); if (controller) setStatus(controller, 'Unlock the vault before submitting to enable save offers.'); return; }
-  const captured = snapshot(form);
-  const observe = () => {
+  let captured = snapshot(form);
+  if (controller && isUnchangedFill(controller, captured)) { debugLog('submission.ignored', { reason: 'unchanged-filler-values', formIndex: captured.form.formIndex }); return; }
+  const fillFinished = controller?.fillFinished;
+  const observe = async () => {
+    // A submit can arrive before START_FILL replies (or during a configured
+    // replay wait). Decide from the completed fill and the values that will
+    // actually be submitted, rather than creating a draft for replay events.
+    if (fillFinished) { await fillFinished; captured = snapshot(form); }
+    if (controller && isUnchangedFill(controller, captured)) { debugLog('submission.ignored', { reason: 'unchanged-filler-values', formIndex: captured.form.formIndex }); return; }
     debugLog('submission.detected', { formIndex: captured.form.formIndex, fieldCount: captured.fields.length });
-    return request<any>({ type: 'SUBMISSION_OBSERVED', requestId: newRequestId(), form: captured });
+    return request<any>({ type: 'SUBMISSION_OBSERVED', requestId: newRequestId(), form: captured }).then((response) => {
+      if (response.ok && response.draftId) createSubmissionPrompt(response.draftId, captured.form);
+      return response;
+    });
   };
   const hasFiles = captured.fields.some((field) => field.value.tag === 'file' && field.value.files.length > 0);
-  if (delaySubmission(event, form, observe, (outcome) => debugLog('submission.resumed', { outcome }), hasFiles)) return;
+  if (delaySubmission(event, form, observe, (outcome) => debugLog('submission.resumed', { outcome }), hasFiles || !!fillFinished)) return;
   void observe();
 }
 async function boot(): Promise<void> {
@@ -235,7 +312,7 @@ async function boot(): Promise<void> {
   const initial = await request<any>({ type: 'GET_SITE_STATUS', requestId: newRequestId() }); if (!initial.ok || !initial.status?.enabled) return; if (!receivedVaultState) vaultUnlocked = !!initial.status.unlocked; debugEnabled = !!initial.status.debug; debugLog('boot', { origin: location.origin, formCount: document.forms.length, vaultUnlocked }); discover(); void showPendingSubmissionPrompt();
   const observer = new MutationObserver(() => { window.clearTimeout((observer as any)._timer); (observer as any)._timer = window.setTimeout(discover, 150); }); observer.observe(document.documentElement, { childList: true, subtree: true });
   addEventListener('scroll', () => { for (const controller of controllers.values()) position(controller); }, { passive: true }); addEventListener('resize', () => { for (const controller of controllers.values()) position(controller); });
-  document.addEventListener('input', () => { revision += 1; }, true); document.addEventListener('change', () => { revision += 1; }, true);
+  document.addEventListener('input', handleEdit, true); document.addEventListener('change', handleEdit, true);
 }
 void boot();
 })();
